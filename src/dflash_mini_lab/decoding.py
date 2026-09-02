@@ -17,6 +17,7 @@ class DecodeStats:
     accepted_draft_tokens: int
     proposed_draft_tokens: int
     wall_seconds: float
+    selector_pair_scores: int = 0
 
     @property
     def tokens_per_second(self) -> float:
@@ -36,7 +37,12 @@ class DecodeStats:
 
     def to_dict(self) -> dict:
         out = asdict(self)
-        out.update(tokens_per_second=self.tokens_per_second, latency_ms=self.latency_ms, acceptance_rate=self.acceptance_rate, tokens_per_target_pass=self.tokens_per_target_pass)
+        out.update(
+            tokens_per_second=self.tokens_per_second,
+            latency_ms=self.latency_ms,
+            acceptance_rate=self.acceptance_rate,
+            tokens_per_target_pass=self.tokens_per_target_pass,
+        )
         return out
 
 
@@ -52,10 +58,17 @@ def normal_decode(runtime: CpuReferenceRuntime, input_ids: list[int] | np.ndarra
     return seq, DecodeStats("normal", max_new_tokens, calls, 0, 0, 0, seconds)
 
 
-def _speculative_decode(runtime: CpuReferenceRuntime, input_ids, max_new_tokens: int, method: str, top_k: int = 4):
+def _speculative_decode(
+    runtime: CpuReferenceRuntime,
+    input_ids,
+    max_new_tokens: int,
+    method: str,
+    top_k: int = 4,
+    mobs_refine_passes: int = 1,
+):
     seq = np.asarray(input_ids, dtype=np.int64).copy()
     start_len = int(seq.size)
-    target_calls = draft_calls = accepted_total = proposed_total = 0
+    target_calls = draft_calls = accepted_total = proposed_total = selector_pair_scores = 0
     t0 = time.perf_counter_ns()
     while int(seq.size) - start_len < max_new_tokens:
         remaining = max_new_tokens - (int(seq.size) - start_len)
@@ -65,7 +78,19 @@ def _speculative_decode(runtime: CpuReferenceRuntime, input_ids, max_new_tokens:
         if method == "dflash":
             proposal = np.argmax(draft_logits, axis=-1).astype(np.int64)
         elif method == "dflash2":
-            proposal = runtime.dflash2_select_path(draft_logits, context, int(seq[-1]), top_k=top_k)
+            k = min(int(top_k), int(draft_logits.shape[-1]))
+            block = int(draft_logits.shape[0])
+            proposal = runtime.dflash2_select_path(draft_logits, context, int(seq[-1]), top_k=k)
+            selector_pair_scores += k + max(0, block - 1) * k * k
+        elif method == "dflash3_mobs":
+            proposal, pair_count = runtime.dflash3_mobs_select_path(
+                draft_logits,
+                context,
+                int(seq[-1]),
+                top_k=top_k,
+                refine_passes=mobs_refine_passes,
+            )
+            selector_pair_scores += int(pair_count)
         else:
             raise ValueError(f"unknown method: {method}")
         proposal = proposal[: min(int(proposal.size), remaining)]
@@ -84,7 +109,16 @@ def _speculative_decode(runtime: CpuReferenceRuntime, input_ids, max_new_tokens:
             seq = np.append(seq, verifier[accepted])
     seq = seq[: start_len + max_new_tokens]
     seconds = (time.perf_counter_ns() - t0) / 1e9
-    return seq, DecodeStats(method, max_new_tokens, target_calls, draft_calls, accepted_total, proposed_total, seconds)
+    return seq, DecodeStats(
+        method,
+        max_new_tokens,
+        target_calls,
+        draft_calls,
+        accepted_total,
+        proposed_total,
+        seconds,
+        selector_pair_scores=selector_pair_scores,
+    )
 
 
 def dflash_decode(runtime: CpuReferenceRuntime, input_ids, max_new_tokens: int):
@@ -93,3 +127,20 @@ def dflash_decode(runtime: CpuReferenceRuntime, input_ids, max_new_tokens: int):
 
 def dflash2_decode(runtime: CpuReferenceRuntime, input_ids, max_new_tokens: int, top_k: int = 4):
     return _speculative_decode(runtime, input_ids, max_new_tokens, method="dflash2", top_k=top_k)
+
+
+def dflash3_mobs_decode(
+    runtime: CpuReferenceRuntime,
+    input_ids,
+    max_new_tokens: int,
+    top_k: int = 4,
+    refine_passes: int = 1,
+):
+    return _speculative_decode(
+        runtime,
+        input_ids,
+        max_new_tokens,
+        method="dflash3_mobs",
+        top_k=top_k,
+        mobs_refine_passes=refine_passes,
+    )

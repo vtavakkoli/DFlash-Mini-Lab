@@ -36,9 +36,9 @@ jobs:
             -e MKL_NUM_THREADS=1 \
             -v "$PWD/ci-reports:/app/reports" \
             dflash-mini-lab \
-            --output-dir /app/reports --tokens 16 --warmups 1 --repeats 2
+            --output-dir /app/reports --tokens 24 --warmups 1 --repeats 5 --top-k 8 --mobs-refine-passes 0
 
-      - name: Validate report and exactness
+      - name: Validate report, exactness and MOBS selector work
         run: |
           test -s ci-reports/report.html
           test -s ci-reports/benchmark.json
@@ -47,11 +47,12 @@ jobs:
           python - <<'PY'
           import json
           d=json.load(open('ci-reports/benchmark.json'))
-          assert d['summary']['normal']['all_exact']
-          assert d['summary']['dflash']['all_exact']
-          assert d['summary']['dflash2']['all_exact']
+          for method in ('normal','dflash','dflash2','dflash3_mobs'):
+              assert d['summary'][method]['all_exact'], method
           assert d['summary']['dflash']['mean_tokens_per_target_pass'] >= 1.0
           assert d['summary']['dflash2']['mean_tokens_per_target_pass'] >= 1.0
+          assert d['summary']['dflash3_mobs']['mean_tokens_per_target_pass'] >= 1.0
+          assert d['summary']['dflash3_mobs']['mean_selector_pair_scores'] < d['summary']['dflash2']['mean_selector_pair_scores']
           print(json.dumps(d['summary'], indent=2))
           PY
 
@@ -77,7 +78,8 @@ jobs:
             "commit": "${GITHUB_SHA}",
             "run_id": "${GITHUB_RUN_ID}",
             "workflow": "${GITHUB_WORKFLOW}",
-            "repository": "${GITHUB_REPOSITORY}"
+            "repository": "${GITHUB_REPOSITORY}",
+            "includes_dflash3_mobs": true
           }
           EOF
 

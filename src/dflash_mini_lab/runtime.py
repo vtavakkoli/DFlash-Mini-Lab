@@ -87,13 +87,15 @@ class CpuReferenceRuntime:
         x = _layer_norm(x, self.p["drafter.norm.weight"], self.p["drafter.norm.bias"])
         return _linear(x, self.p["drafter.head.weight"], self.p["drafter.head.bias"]).astype(np.float32, copy=False)
 
+    def _selector_state(self, context: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        gate = np.tanh(_linear(context[None, :], self.p["selector.gate.0.weight"], self.p["selector.gate.0.bias"])[0])
+        return gate, self.p["selector.a.weight"], self.p["selector.b.weight"]
+
     def dflash2_select_path(self, draft_logits: np.ndarray, context: np.ndarray, prev_token: int, top_k: int = 4) -> np.ndarray:
         k = min(int(top_k), int(draft_logits.shape[-1]))
         top_ids = np.argsort(draft_logits, axis=-1)[:, -k:][:, ::-1]
         top_vals = np.take_along_axis(draft_logits, top_ids, axis=-1)
-        gate = np.tanh(_linear(context[None, :], self.p["selector.gate.0.weight"], self.p["selector.gate.0.bias"])[0])
-        a = self.p["selector.a.weight"]
-        b = self.p["selector.b.weight"]
+        gate, a, b = self._selector_state(context)
 
         def pair(prev_ids: np.ndarray, cur_ids: np.ndarray) -> np.ndarray:
             pa = a[np.asarray(prev_ids, dtype=np.int64)] * gate[None, :]
@@ -114,3 +116,107 @@ class CpuReferenceRuntime:
             chosen.append(idx)
         chosen.reverse()
         return np.asarray([top_ids[pos, chosen[pos]] for pos in range(top_ids.shape[0])], dtype=np.int64)
+
+    def dflash3_mobs_select_path(
+        self,
+        draft_logits: np.ndarray,
+        context: np.ndarray,
+        prev_token: int,
+        top_k: int = 4,
+        refine_passes: int = 1,
+    ) -> tuple[np.ndarray, int]:
+        """Middle-Out Bidirectional Selection (MOBS), with O(B*K) selector work."""
+        k = min(int(top_k), int(draft_logits.shape[-1]))
+        top_ids = np.argsort(draft_logits, axis=-1)[:, -k:][:, ::-1]
+        top_vals = np.take_along_axis(draft_logits, top_ids, axis=-1)
+        block = int(top_ids.shape[0])
+        if block == 0:
+            return np.empty(0, dtype=np.int64), 0
+
+        gate, a, b = self._selector_state(context)
+        pair_scores = 0
+
+        def forward(prev_id: int, cur_ids: np.ndarray) -> np.ndarray:
+            nonlocal pair_scores
+            ids = np.asarray(cur_ids, dtype=np.int64)
+            pair_scores += int(ids.size)
+            pa = a[int(prev_id)] * gate
+            return (b[ids] * pa[None, :]).sum(axis=-1) * self.selector_scale
+
+        def backward(prev_ids: np.ndarray, next_id: int) -> np.ndarray:
+            nonlocal pair_scores
+            ids = np.asarray(prev_ids, dtype=np.int64)
+            pair_scores += int(ids.size)
+            cb = b[int(next_id)]
+            return ((a[ids] * gate[None, :]) * cb[None, :]).sum(axis=-1) * self.selector_scale
+
+        def forward_many(prev_ids: np.ndarray, cur_ids: np.ndarray) -> np.ndarray:
+            nonlocal pair_scores
+            prev = np.asarray(prev_ids, dtype=np.int64)
+            cur = np.asarray(cur_ids, dtype=np.int64)
+            pair_scores += int(cur.size)
+            pa = a[prev] * gate[None, :]
+            return (b[cur] * pa[:, None, :]).sum(axis=-1) * self.selector_scale
+
+        def backward_many(prev_ids: np.ndarray, next_ids: np.ndarray) -> np.ndarray:
+            nonlocal pair_scores
+            prev = np.asarray(prev_ids, dtype=np.int64)
+            nxt = np.asarray(next_ids, dtype=np.int64)
+            pair_scores += int(prev.size)
+            cb = b[nxt]
+            return ((a[prev] * gate[None, None, :]) * cb[:, None, :]).sum(axis=-1) * self.selector_scale
+
+        # Reproducible random-middle choice between the two central slots.
+        if block % 2:
+            anchor = block // 2
+        else:
+            centers = (block // 2 - 1, block // 2)
+            context_fingerprint = int(float(np.abs(context[: min(8, context.size)]).sum()) * 1_000_000.0)
+            anchor = centers[(context_fingerprint ^ (int(prev_token) * 0x9E3779B1)) & 1]
+
+        chosen = np.full(block, -1, dtype=np.int64)
+        anchor_candidates = top_ids[anchor]
+        anchor_scores = top_vals[anchor] + forward(prev_token, anchor_candidates)
+        chosen[anchor] = int(anchor_candidates[int(np.argmax(anchor_scores))])
+
+        # Middle-out expansion: K scores per newly selected position.
+        for distance in range(1, block + 1):
+            left = anchor - distance
+            if left >= 0:
+                candidates = top_ids[left]
+                scores = top_vals[left] + backward(candidates, int(chosen[left + 1]))
+                if left == 0:
+                    scores = scores + forward(prev_token, candidates)
+                chosen[left] = int(candidates[int(np.argmax(scores))])
+
+            right = anchor + distance
+            if right < block:
+                candidates = top_ids[right]
+                scores = top_vals[right] + forward(int(chosen[right - 1]), candidates)
+                chosen[right] = int(candidates[int(np.argmax(scores))])
+
+        # Vectorized odd/even bubble-like refinement. Each parity is evaluated as one
+        # NumPy batch, avoiding a Python loop per position while retaining O(B*K).
+        for _ in range(max(0, int(refine_passes))):
+            for parity in (0, 1):
+                positions = np.arange(parity, block, 2, dtype=np.int64)
+                if positions.size == 0:
+                    continue
+                snapshot = chosen.copy()
+                candidates = top_ids[positions]
+                scores = top_vals[positions].copy()
+
+                prev_positions = np.maximum(positions - 1, 0)
+                prev_ids = snapshot[prev_positions]
+                prev_ids = np.where(positions == 0, int(prev_token), prev_ids)
+                scores += forward_many(prev_ids, candidates)
+
+                has_right = positions + 1 < block
+                if np.any(has_right):
+                    right_positions = positions[has_right] + 1
+                    scores[has_right] += backward_many(candidates[has_right], snapshot[right_positions])
+
+                best = np.argmax(scores, axis=1)
+                chosen[positions] = candidates[np.arange(positions.size), best]
+
+        return chosen, pair_scores
