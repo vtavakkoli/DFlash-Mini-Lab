@@ -100,17 +100,18 @@ def make_architecture_gif(out_path: str | Path) -> None:
             d.text((355, 270), "K scores per new position", font=_font(15, True), fill=MUTED)
 
         if step >= 27:
-            d.text((37, 329), "3. One odd/even bubble-like local refinement", font=_font(16, True), fill=PURPLE)
+            d.text((37, 329), "3. Optional odd/even bubble-like refinement", font=_font(16, True), fill=PURPLE)
+            d.text((37, 355), "disabled in the CPU fast-path benchmark", font=_font(14), fill=MUTED)
             for pos in range(6):
                 x = 220 + pos * 112
                 color = PURPLE if (pos + step) % 2 == 0 else (202, 191, 225)
-                d.rounded_rectangle((x, 318, x + 88, 360), radius=8, fill=color)
-                d.text((x + 32, 329), f"t{pos+1}", font=_font(14, True), fill=(255, 255, 255))
+                d.rounded_rectangle((x, 378, x + 88, 416), radius=8, fill=color)
+                d.text((x + 32, 387), f"t{pos+1}", font=_font(14, True), fill=(255, 255, 255))
 
         if step >= 34:
-            d.rounded_rectangle((220, 405, 892, 461), radius=10, fill=GREEN)
-            d.text((376, 423), "TARGET verifies selected path exactly", font=_font(17, True), fill=(255, 255, 255))
-            d.text((265, 484), "Selector complexity: O(BK), versus DFlash2 transition grid O(BK²)", font=_font(16, True), fill=TEXT)
+            d.rounded_rectangle((220, 432, 892, 482), radius=10, fill=GREEN)
+            d.text((376, 447), "TARGET verifies selected path exactly", font=_font(17, True), fill=(255, 255, 255))
+            d.text((265, 501), "Core selector: O(BK), versus DFlash2 transition grid O(BK²)", font=_font(15, True), fill=TEXT)
         frames.append(im)
     Path(out_path).parent.mkdir(parents=True, exist_ok=True)
     frames[0].save(out_path, save_all=True, append_images=frames[1:], duration=100, loop=0, optimize=True)
