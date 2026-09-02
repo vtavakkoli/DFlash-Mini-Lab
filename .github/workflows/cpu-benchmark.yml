@@ -6,14 +6,26 @@ on:
   pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: read
+  actions: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: "pages-${{ github.ref }}"
+  cancel-in-progress: true
+
 jobs:
   docker-benchmark:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
+
       - name: Build deterministic CPU-only image
         run: docker build -t dflash-mini-lab .
+
       - name: Run reproducible benchmark
         run: |
           rm -rf ci-reports && mkdir -p ci-reports
@@ -25,6 +37,7 @@ jobs:
             -v "$PWD/ci-reports:/app/reports" \
             dflash-mini-lab \
             --output-dir /app/reports --tokens 16 --warmups 1 --repeats 2
+
       - name: Validate report and exactness
         run: |
           test -s ci-reports/report.html
@@ -41,8 +54,52 @@ jobs:
           assert d['summary']['dflash2']['mean_tokens_per_target_pass'] >= 1.0
           print(json.dumps(d['summary'], indent=2))
           PY
+
       - name: Upload benchmark artifacts
         uses: actions/upload-artifact@v4
         with:
           name: dflash-cpu-report
           path: ci-reports/
+
+      - name: Prepare verified Pages site
+        if: github.event_name != 'pull_request'
+        run: |
+          rm -rf pages && mkdir -p pages
+          cp ci-reports/report.html pages/index.html
+          cp ci-reports/report.html pages/report.html
+          cp ci-reports/benchmark.json pages/benchmark.json
+          cp ci-reports/speedup.gif pages/speedup.gif
+          cp ci-reports/architecture.gif pages/architecture.gif
+          touch pages/.nojekyll
+          cat > pages/verification.json <<EOF
+          {
+            "verified": true,
+            "commit": "${GITHUB_SHA}",
+            "run_id": "${GITHUB_RUN_ID}",
+            "workflow": "${GITHUB_WORKFLOW}",
+            "repository": "${GITHUB_REPOSITORY}"
+          }
+          EOF
+
+      - name: Upload GitHub Pages artifact
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: pages
+
+  deploy-pages:
+    if: github.event_name != 'pull_request'
+    needs: docker-benchmark
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      pages: write
+      id-token: write
+      actions: read
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy verified benchmark to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
