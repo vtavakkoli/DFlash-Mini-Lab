@@ -125,14 +125,7 @@ class CpuReferenceRuntime:
         top_k: int = 4,
         refine_passes: int = 1,
     ) -> tuple[np.ndarray, int]:
-        """Middle-Out Bidirectional Selection (MOBS), with O(B*K) selector work.
-
-        A deterministic pseudo-random choice between the two central positions is used
-        as the anchor for even-sized blocks. Selection then expands left/right using
-        only K comparisons against the already selected neighbor. Optional odd/even
-        local refinement is bubble-like but still linear in B*K for a fixed number of
-        passes. The returned counter is the number of pair scores actually evaluated.
-        """
+        """Middle-Out Bidirectional Selection (MOBS), with O(B*K) selector work."""
         k = min(int(top_k), int(draft_logits.shape[-1]))
         top_ids = np.argsort(draft_logits, axis=-1)[:, -k:][:, ::-1]
         top_vals = np.take_along_axis(draft_logits, top_ids, axis=-1)
@@ -157,8 +150,23 @@ class CpuReferenceRuntime:
             cb = b[int(next_id)]
             return ((a[ids] * gate[None, :]) * cb[None, :]).sum(axis=-1) * self.selector_scale
 
-        # Reproducible "random middle": for an even block, choose one of the two
-        # central slots from a cheap context/previous-token fingerprint.
+        def forward_many(prev_ids: np.ndarray, cur_ids: np.ndarray) -> np.ndarray:
+            nonlocal pair_scores
+            prev = np.asarray(prev_ids, dtype=np.int64)
+            cur = np.asarray(cur_ids, dtype=np.int64)
+            pair_scores += int(cur.size)
+            pa = a[prev] * gate[None, :]
+            return (b[cur] * pa[:, None, :]).sum(axis=-1) * self.selector_scale
+
+        def backward_many(prev_ids: np.ndarray, next_ids: np.ndarray) -> np.ndarray:
+            nonlocal pair_scores
+            prev = np.asarray(prev_ids, dtype=np.int64)
+            nxt = np.asarray(next_ids, dtype=np.int64)
+            pair_scores += int(prev.size)
+            cb = b[nxt]
+            return ((a[prev] * gate[None, None, :]) * cb[:, None, :]).sum(axis=-1) * self.selector_scale
+
+        # Reproducible random-middle choice between the two central slots.
         if block % 2:
             anchor = block // 2
         else:
@@ -171,8 +179,7 @@ class CpuReferenceRuntime:
         anchor_scores = top_vals[anchor] + forward(prev_token, anchor_candidates)
         chosen[anchor] = int(anchor_candidates[int(np.argmax(anchor_scores))])
 
-        # Expand from the anchor in both directions. Every new position evaluates
-        # K candidates against one selected neighbor: O(B*K), not O(B*K^2).
+        # Middle-out expansion: K scores per newly selected position.
         for distance in range(1, block + 1):
             left = anchor - distance
             if left >= 0:
@@ -188,21 +195,28 @@ class CpuReferenceRuntime:
                 scores = top_vals[right] + forward(int(chosen[right - 1]), candidates)
                 chosen[right] = int(candidates[int(np.argmax(scores))])
 
-        # One or more fixed odd/even "bubble" refinement passes. Each candidate is
-        # scored only against its selected neighbors, preserving O(B*K) complexity
-        # for constant refine_passes rather than constructing a KxK transition grid.
+        # Vectorized odd/even bubble-like refinement. Each parity is evaluated as one
+        # NumPy batch, avoiding a Python loop per position while retaining O(B*K).
         for _ in range(max(0, int(refine_passes))):
             for parity in (0, 1):
+                positions = np.arange(parity, block, 2, dtype=np.int64)
+                if positions.size == 0:
+                    continue
                 snapshot = chosen.copy()
-                for pos in range(parity, block, 2):
-                    candidates = top_ids[pos]
-                    scores = top_vals[pos].copy()
-                    if pos == 0:
-                        scores += forward(prev_token, candidates)
-                    else:
-                        scores += forward(int(snapshot[pos - 1]), candidates)
-                    if pos + 1 < block:
-                        scores += backward(candidates, int(snapshot[pos + 1]))
-                    chosen[pos] = int(candidates[int(np.argmax(scores))])
+                candidates = top_ids[positions]
+                scores = top_vals[positions].copy()
+
+                prev_positions = np.maximum(positions - 1, 0)
+                prev_ids = snapshot[prev_positions]
+                prev_ids = np.where(positions == 0, int(prev_token), prev_ids)
+                scores += forward_many(prev_ids, candidates)
+
+                has_right = positions + 1 < block
+                if np.any(has_right):
+                    right_positions = positions[has_right] + 1
+                    scores[has_right] += backward_many(candidates[has_right], snapshot[right_positions])
+
+                best = np.argmax(scores, axis=1)
+                chosen[positions] = candidates[np.arange(positions.size), best]
 
         return chosen, pair_scores
