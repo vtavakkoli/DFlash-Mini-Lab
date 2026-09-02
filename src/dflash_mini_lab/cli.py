@@ -24,7 +24,7 @@ def main() -> None:
     p.add_argument("--warmups", type=int, default=1)
     p.add_argument("--repeats", type=int, default=3)
     p.add_argument("--top-k", type=int, default=4, help="Top-k candidates used by DFlash2 and DFlash3-MOBS")
-    p.add_argument("--mobs-refine-passes", type=int, default=1, help="Fixed odd/even local refinement passes for DFlash3-MOBS")
+    p.add_argument("--mobs-refine-passes", type=int, default=0, help="Optional odd/even local refinement passes for DFlash3-MOBS; 0 is the CPU fast path")
     args = p.parse_args()
     out = Path(args.output_dir)
     out.mkdir(parents=True, exist_ok=True)
