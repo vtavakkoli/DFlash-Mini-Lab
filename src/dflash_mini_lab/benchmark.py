@@ -39,7 +39,7 @@ def run_benchmark(
     warmups: int = 1,
     repeats: int = 3,
     top_k: int = 4,
-    mobs_refine_passes: int = 1,
+    mobs_refine_passes: int = 0,
 ) -> dict:
     runtime = CpuReferenceRuntime(weights_path)
     tok = WordTokenizer.load(tokenizer_path)
@@ -102,7 +102,7 @@ def run_benchmark(
         "benchmark_name": "DFlash Mini Lab CPU reference benchmark",
         "generated_unix": int(time.time()),
         "backend": "NumPy float32 / BLAS CPU reference runtime",
-        "fidelity_note": "Mechanism-level educational implementation. DFlash uses one-pass parallel block drafting plus lossless verifier correction. DFlash2 adds learned low-rank predecessor-conditioned top-k dynamic-programming path selection. DFlash3-MOBS uses a reproducible middle anchor, bidirectional O(B*K) neighbor selection and fixed odd/even local refinement. It does not claim binary equivalence with upstream GPU kernels/checkpoints.",
+        "fidelity_note": "Mechanism-level educational implementation. DFlash uses one-pass parallel block drafting plus lossless verifier correction. DFlash2 adds learned low-rank predecessor-conditioned top-k dynamic-programming path selection. DFlash3-MOBS uses a reproducible middle anchor and bidirectional O(B*K) neighbor selection; an optional fixed odd/even local refinement can be enabled for ablation. It does not claim binary equivalence with upstream GPU kernels/checkpoints.",
         "timing_note": "The tiny reference target recomputes the visible sequence on each target forward pass and does not implement a production KV cache. Use the results for reproducible relative algorithm study, not as production serving throughput.",
         "system": {"platform": platform.platform(), "python": platform.python_version(), "processor": platform.processor() or "unknown", "numpy": np.__version__, "cpu_threads_env": os.getenv("CPU_THREADS", "1")},
         "config": {
