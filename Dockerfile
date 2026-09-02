@@ -24,8 +24,9 @@ COPY src ./src
 RUN python -m pip install --upgrade pip && python -m pip install .
 COPY --from=model-builder /build/models ./models
 COPY benchmarks ./benchmarks
-RUN mkdir -p /app/reports && useradd --create-home --uid 10001 benchmark && chown -R benchmark:benchmark /app
-USER benchmark
+RUN mkdir -p /app/reports
 
+# Keep the benchmark container write-compatible with bind-mounted report folders
+# across Linux/macOS/Windows hosts. It does not expose a network service.
 ENTRYPOINT ["python", "-m", "dflash_mini_lab.cli"]
 CMD ["--output-dir", "/app/reports"]
