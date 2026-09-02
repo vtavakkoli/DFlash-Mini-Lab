@@ -36,7 +36,7 @@ jobs:
             -e MKL_NUM_THREADS=1 \
             -v "$PWD/ci-reports:/app/reports" \
             dflash-mini-lab \
-            --output-dir /app/reports --tokens 16 --warmups 1 --repeats 2 --top-k 8 --mobs-refine-passes 0
+            --output-dir /app/reports --tokens 24 --warmups 1 --repeats 5 --top-k 8 --mobs-refine-passes 0
 
       - name: Validate report, exactness and MOBS selector work
         run: |
