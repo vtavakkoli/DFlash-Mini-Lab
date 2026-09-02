@@ -1,0 +1,48 @@
+name: CPU benchmark
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  docker-benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build deterministic CPU-only image
+        run: docker build -t dflash-mini-lab .
+      - name: Run reproducible benchmark
+        run: |
+          rm -rf ci-reports && mkdir -p ci-reports
+          docker run --rm \
+            -e CPU_THREADS=1 \
+            -e OPENBLAS_NUM_THREADS=1 \
+            -e OMP_NUM_THREADS=1 \
+            -e MKL_NUM_THREADS=1 \
+            -v "$PWD/ci-reports:/app/reports" \
+            dflash-mini-lab \
+            --output-dir /app/reports --tokens 16 --warmups 1 --repeats 2
+      - name: Validate report and exactness
+        run: |
+          test -s ci-reports/report.html
+          test -s ci-reports/benchmark.json
+          test -s ci-reports/speedup.gif
+          test -s ci-reports/architecture.gif
+          python - <<'PY'
+          import json
+          d=json.load(open('ci-reports/benchmark.json'))
+          assert d['summary']['normal']['all_exact']
+          assert d['summary']['dflash']['all_exact']
+          assert d['summary']['dflash2']['all_exact']
+          assert d['summary']['dflash']['mean_tokens_per_target_pass'] >= 1.0
+          assert d['summary']['dflash2']['mean_tokens_per_target_pass'] >= 1.0
+          print(json.dumps(d['summary'], indent=2))
+          PY
+      - name: Upload benchmark artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dflash-cpu-report
+          path: ci-reports/

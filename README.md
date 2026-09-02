@@ -15,7 +15,7 @@ The goal is to make the algorithms runnable, measurable and visually understanda
 
 - CPU-only Docker image; no CUDA/GPU runtime.
 - Lightweight NumPy/BLAS float32 inference backend.
-- Fixed tiny 2-layer causal Transformer SLM target.
+- Deterministically rebuilt tiny 2-layer causal Transformer SLM target.
 - One-pass non-causal block drafter for DFlash mode.
 - Learned low-rank top-k path selector for DFlash v2 mode.
 - Identical prompts, token budget and verifier for all modes.
@@ -28,13 +28,13 @@ The goal is to make the algorithms runnable, measurable and visually understanda
 
 ## Current sample result
 
-The committed sample was generated on the development CPU with one BLAS thread and 24 generated tokens per prompt. It is included only to demonstrate the pipeline; run Docker on your machine for hardware-specific numbers.
+The sample below was generated with the same fixed seed/training recipe used by the Docker model-builder stage, one BLAS thread, and 24 generated tokens per prompt. Absolute throughput is hardware-specific, so run Docker on your machine for your own numbers.
 
 | Mode | Median tok/s | Median latency | Speedup | Tokens / target pass | Draft acceptance | Exact vs normal |
 |---|---:|---:|---:|---:|---:|:---:|
-| Normal | 2409.40 | 9.96 ms | 1.00× | 1.00 | — | ✓ |
-| DFlash | 4785.25 | 5.02 ms | 1.99× | 2.72 | 53.0% | ✓ |
-| DFlash v2 | 4104.35 | 5.85 ms | 1.70× | 2.85 | 57.6% | ✓ |
+| Normal | 2598.73 | 9.24 ms | 1.00× | 1.00 | — | ✓ |
+| DFlash | 4581.86 | 5.24 ms | 1.76× | 2.40 | 47.6% | ✓ |
+| DFlash v2 | 4288.70 | 5.60 ms | 1.65× | 2.62 | 55.7% | ✓ |
 
 A useful observation from this tiny CPU case is that DFlash v2 accepts more useful draft tokens per target pass, but its Python/NumPy path selector adds enough overhead that raw tok/s is below the simpler DFlash path. That distinction between **acceptance efficiency** and **end-to-end throughput** is one reason this lab exists.
 
@@ -70,9 +70,13 @@ Open `reports/report.html` in a browser. The HTML is self-contained: both GIFs a
 
 ## Local Python run
 
+Docker is the recommended path because it rebuilds the reference weights automatically. For a local developer run:
+
 ```bash
 python -m venv .venv
 source .venv/bin/activate      # Windows: .venv\Scripts\activate
+python -m pip install torch==2.10.0 --index-url https://download.pytorch.org/whl/cpu
+python training/build_weights.py --output-dir models
 python -m pip install -e '.[test]'
 pytest
 CPU_THREADS=1 python -m dflash_mini_lab.cli --output-dir reports
@@ -143,8 +147,8 @@ Metrics include median/mean generated tok/s, median/p95 decode latency, speedup 
 
 ```text
 benchmarks/prompts.json          fixed workload
-models/tiny_dflash_lab.npz       float32 target/drafter/selector weights
-models/tokenizer.json            fixed tokenizer
+training/build_weights.py        deterministic CPU model builder
+models/                           generated float32 weights/tokenizer (Docker build output)
 src/dflash_mini_lab/runtime.py   tiny NumPy Transformer + drafter runtime
 src/dflash_mini_lab/decoding.py  normal / DFlash / DFlash v2 decoders
 src/dflash_mini_lab/benchmark.py metrics + exactness collection
@@ -157,9 +161,9 @@ tests/                           exactness + artifact tests
 ## References
 
 - Jian Chen, Yesheng Liang, Zhijian Liu. **DFlash: Block Diffusion for Flash Speculative Decoding.** arXiv:2602.06036 (2026).
-- Official DFlash project: `z-lab/dflash`.
-- vLLM Speculators documentation for DFlash and DFlash2.
-- Inco AI: **DFlash 2: Keep Drafting Parallel** (2026).
+- Official DFlash project: https://github.com/z-lab/dflash
+- vLLM Speculators documentation: https://docs.vllm.ai/projects/speculators/en/latest/user_guide/algorithms/
+- Inco AI: **DFlash 2: Keep Drafting Parallel** (2026): https://inco.ai/blog/dflash2/
 
 See [`docs/algorithm.md`](docs/algorithm.md) for the exact scope of this implementation and [`docs/reproducibility.md`](docs/reproducibility.md) for benchmark controls.
 

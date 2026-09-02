@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+*.egg-info/
+build/
+dist/
+.DS_Store
+models/*.npz
+models/tokenizer.json
+models/manifest.json
+reports/*.json
+reports/*.html
+reports/*.gif
+reports/*.tmp
+ci-reports/
