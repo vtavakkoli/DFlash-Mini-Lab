@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=75", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dflash-mini-lab"
+version = "1.0.0"
+description = "Reproducible CPU-only benchmark lab for normal, DFlash-style and DFlash v2-style decoding"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [{name = "Vahid Tavakkoli"}]
+dependencies = [
+  "numpy==2.3.5",
+  "Pillow==12.3.0",
+]
+
+[project.optional-dependencies]
+test = ["pytest==9.0.2"]
+
+[project.scripts]
+dflash-mini-lab = "dflash_mini_lab.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]
