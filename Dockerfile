@@ -4,6 +4,7 @@ ENV PIP_NO_CACHE_DIR=1 PYTHONUNBUFFERED=1
 WORKDIR /build
 COPY training ./training
 RUN python -m pip install --upgrade pip \
+ && python -m pip install numpy==2.3.5 \
  && python -m pip install torch==2.10.0 --index-url https://download.pytorch.org/whl/cpu \
  && python training/build_weights.py --output-dir /build/models
 
