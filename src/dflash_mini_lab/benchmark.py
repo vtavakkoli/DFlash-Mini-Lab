@@ -9,25 +9,23 @@ from pathlib import Path
 
 import numpy as np
 
-from .decoding import dflash2_decode, dflash3_mobs_decode, dflash_decode, normal_decode
+from .decoding import dflash2_decode, dflash3_mobs_decode, dflash4_jump_mobs_decode, dflash_decode, normal_decode
 from .runtime import CpuReferenceRuntime
 from .tokenizer import WordTokenizer
 
-METHODS = ("normal", "dflash", "dflash2", "dflash3_mobs")
+METHODS = ("normal", "dflash", "dflash2", "dflash3_mobs", "dflash4_jump_mobs")
 
 
 def _percentile(values: list[float], q: float) -> float:
     return float(np.percentile(np.asarray(values, dtype=np.float64), q)) if values else 0.0
 
 
-def _decode(method: str, runtime, ids, tokens, top_k, mobs_refine_passes):
-    if method == "normal":
-        return normal_decode(runtime, ids, tokens)
-    if method == "dflash":
-        return dflash_decode(runtime, ids, tokens)
-    if method == "dflash2":
-        return dflash2_decode(runtime, ids, tokens, top_k=top_k)
-    return dflash3_mobs_decode(runtime, ids, tokens, top_k=top_k, refine_passes=mobs_refine_passes)
+def _decode(method: str, runtime, ids, tokens, top_k, mobs_refine_passes, jump_weight):
+    if method == "normal": return normal_decode(runtime, ids, tokens)
+    if method == "dflash": return dflash_decode(runtime, ids, tokens)
+    if method == "dflash2": return dflash2_decode(runtime, ids, tokens, top_k=top_k)
+    if method == "dflash3_mobs": return dflash3_mobs_decode(runtime, ids, tokens, top_k=top_k, refine_passes=mobs_refine_passes)
+    return dflash4_jump_mobs_decode(runtime, ids, tokens, top_k=top_k, jump_weight=jump_weight)
 
 
 def run_benchmark(
@@ -40,6 +38,7 @@ def run_benchmark(
     repeats: int = 3,
     top_k: int = 4,
     mobs_refine_passes: int = 0,
+    jump_weight: float = 0.5,
 ) -> dict:
     runtime = CpuReferenceRuntime(weights_path)
     tok = WordTokenizer.load(tokenizer_path)
@@ -47,7 +46,7 @@ def run_benchmark(
     warm_prompt = tok.encode(prompts[0])
     for _ in range(max(0, warmups)):
         for method in METHODS:
-            _decode(method, runtime, warm_prompt, min(6, max_new_tokens), top_k, mobs_refine_passes)
+            _decode(method, runtime, warm_prompt, min(6, max_new_tokens), top_k, mobs_refine_passes, jump_weight)
     runs: list[dict] = []
     exactness: list[dict] = []
     for prompt_index, prompt in enumerate(prompts):
@@ -55,22 +54,22 @@ def run_benchmark(
         normal_reference, _ = normal_decode(runtime, ids, max_new_tokens)
         for repeat in range(repeats):
             for method in METHODS:
-                output, stats = _decode(method, runtime, ids, max_new_tokens, top_k, mobs_refine_passes)
+                output, stats = _decode(method, runtime, ids, max_new_tokens, top_k, mobs_refine_passes, jump_weight)
                 row = stats.to_dict()
                 row.update(prompt=prompt, prompt_index=prompt_index, repeat=repeat, exact_match=bool(np.array_equal(output, normal_reference)))
                 runs.append(row)
         df_out, _ = dflash_decode(runtime, ids, max_new_tokens)
         d2_out, _ = dflash2_decode(runtime, ids, max_new_tokens, top_k=top_k)
         d3_out, _ = dflash3_mobs_decode(runtime, ids, max_new_tokens, top_k=top_k, refine_passes=mobs_refine_passes)
-        exactness.append(
-            {
-                "prompt": prompt,
-                "normal_equals_dflash": bool(np.array_equal(normal_reference, df_out)),
-                "normal_equals_dflash2": bool(np.array_equal(normal_reference, d2_out)),
-                "normal_equals_dflash3_mobs": bool(np.array_equal(normal_reference, d3_out)),
-                "normal_text": tok.decode(normal_reference.tolist()),
-            }
-        )
+        d4_out, _ = dflash4_jump_mobs_decode(runtime, ids, max_new_tokens, top_k=top_k, jump_weight=jump_weight)
+        exactness.append({
+            "prompt": prompt,
+            "normal_equals_dflash": bool(np.array_equal(normal_reference, df_out)),
+            "normal_equals_dflash2": bool(np.array_equal(normal_reference, d2_out)),
+            "normal_equals_dflash3_mobs": bool(np.array_equal(normal_reference, d3_out)),
+            "normal_equals_dflash4_jump_mobs": bool(np.array_equal(normal_reference, d4_out)),
+            "normal_text": tok.decode(normal_reference.tolist()),
+        })
     summary: dict[str, dict] = {}
     for method in METHODS:
         subset = [r for r in runs if r["method"] == method]
@@ -84,25 +83,35 @@ def run_benchmark(
             "latency_ms_p95": _percentile(lat, 95),
             "mean_target_forward_passes": statistics.fmean(float(r["target_forward_passes"]) for r in subset),
             "mean_draft_forward_passes": statistics.fmean(float(r["draft_forward_passes"]) for r in subset),
+            "mean_jump_forward_passes": statistics.fmean(float(r["jump_forward_passes"]) for r in subset),
             "mean_acceptance_rate": statistics.fmean(float(r["acceptance_rate"]) for r in subset),
             "mean_tokens_per_target_pass": statistics.fmean(float(r["tokens_per_target_pass"]) for r in subset),
             "mean_selector_pair_scores": statistics.fmean(float(r["selector_pair_scores"]) for r in subset),
+            "mean_jump_candidate_scores": statistics.fmean(float(r["jump_candidate_scores"]) for r in subset),
+            "mean_total_guidance_scores": statistics.fmean(float(r["total_guidance_scores"]) for r in subset),
             "all_exact": all(bool(r["exact_match"]) for r in subset),
         }
     baseline = summary["normal"]["tokens_per_second_median"]
     for method in METHODS:
         summary[method]["speedup_vs_normal"] = summary[method]["tokens_per_second_median"] / max(baseline, 1e-12)
+
     d2_work = summary["dflash2"]["mean_selector_pair_scores"]
     d3_work = summary["dflash3_mobs"]["mean_selector_pair_scores"]
+    d4_work = summary["dflash4_jump_mobs"]["mean_total_guidance_scores"]
     summary["dflash3_mobs"]["selector_work_ratio_vs_dflash2"] = d3_work / max(d2_work, 1e-12)
     summary["dflash3_mobs"]["selector_work_reduction_vs_dflash2"] = 1.0 - d3_work / max(d2_work, 1e-12)
     summary["dflash3_mobs"]["throughput_ratio_vs_dflash2"] = summary["dflash3_mobs"]["tokens_per_second_median"] / max(summary["dflash2"]["tokens_per_second_median"], 1e-12)
+    summary["dflash4_jump_mobs"]["guidance_work_ratio_vs_dflash2"] = d4_work / max(d2_work, 1e-12)
+    summary["dflash4_jump_mobs"]["guidance_work_reduction_vs_dflash2"] = 1.0 - d4_work / max(d2_work, 1e-12)
+    summary["dflash4_jump_mobs"]["throughput_ratio_vs_dflash2"] = summary["dflash4_jump_mobs"]["tokens_per_second_median"] / max(summary["dflash2"]["tokens_per_second_median"], 1e-12)
+    summary["dflash4_jump_mobs"]["throughput_ratio_vs_mobs"] = summary["dflash4_jump_mobs"]["tokens_per_second_median"] / max(summary["dflash3_mobs"]["tokens_per_second_median"], 1e-12)
+
     payload = {
-        "schema_version": 2,
+        "schema_version": 3,
         "benchmark_name": "DFlash Mini Lab CPU reference benchmark",
         "generated_unix": int(time.time()),
         "backend": "NumPy float32 / BLAS CPU reference runtime",
-        "fidelity_note": "Mechanism-level educational implementation. DFlash uses one-pass parallel block drafting plus lossless verifier correction. DFlash2 adds learned low-rank predecessor-conditioned top-k dynamic-programming path selection. DFlash3-MOBS uses a reproducible middle anchor and bidirectional O(B*K) neighbor selection; an optional fixed odd/even local refinement can be enabled for ablation. It does not claim binary equivalence with upstream GPU kernels/checkpoints.",
+        "fidelity_note": "Mechanism-level educational implementation. DFlash uses one-pass parallel block drafting plus lossless verifier correction. DFlash2 adds learned low-rank predecessor-conditioned top-k dynamic-programming path selection. DFlash3-MOBS uses a reproducible middle anchor and O(B*K) neighbor selection. DFlash4-JUMP-MOBS adds a separately trained lightweight indexed future-token head at sparse +2/+4 offsets, locks those approximate anchors, then fills gaps with O(B*K) local guidance before the same exact verifier.",
         "timing_note": "The tiny reference target recomputes the visible sequence on each target forward pass and does not implement a production KV cache. Use the results for reproducible relative algorithm study, not as production serving throughput.",
         "system": {"platform": platform.platform(), "python": platform.python_version(), "processor": platform.processor() or "unknown", "numpy": np.__version__, "cpu_threads_env": os.getenv("CPU_THREADS", "1")},
         "config": {
@@ -114,6 +123,9 @@ def run_benchmark(
             "dflash2_top_k": top_k,
             "dflash3_mobs_top_k": top_k,
             "dflash3_mobs_refine_passes": mobs_refine_passes,
+            "dflash4_jump_mobs_top_k": top_k,
+            "dflash4_jump_weight": jump_weight,
+            "dflash4_jump_offsets": runtime.jump_offsets.tolist(),
         },
         "summary": summary,
         "exactness": exactness,
