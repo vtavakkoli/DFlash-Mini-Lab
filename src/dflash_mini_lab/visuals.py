@@ -60,28 +60,23 @@ def make_architecture_gif(out_path: str | Path) -> None:
         d.text((42, 108), "1. One parallel drafter pass", font=_font(18, True), fill=ORANGE)
         d.rounded_rectangle((230, 96, 790, 148), radius=10, outline=ORANGE, width=3)
         d.text((370, 112), "shared non-causal drafter hidden states", font=_font(15, True), fill=ORANGE)
-
         if step >= 7:
             d.text((42, 184), "2. Shared hidden state branches", font=_font(18, True), fill=EMERALD)
             d.line((510, 150, 510, 205), fill=EMERALD, width=4)
             d.line((510, 205, 340, 240), fill=ORANGE, width=4); d.line((510, 205, 680, 240), fill=EMERALD, width=4)
             d.rounded_rectangle((245, 238, 435, 282), radius=9, fill=ORANGE); d.text((280, 251), "normal draft logits", font=_font(14, True), fill=(255,255,255))
-            d.rounded_rectangle((585, 238, 775, 282), radius=9, fill=EMERALD); d.text((608, 251), "rank-16 jump residual", font=_font(14, True), fill=(255,255,255))
-
+            d.rounded_rectangle((585, 238, 775, 282), radius=9, fill=EMERALD); d.text((613, 251), "low-rank jump residual", font=_font(14, True), fill=(255,255,255))
         if step >= 14:
             d.text((42, 320), "3. Score only retained top-k at +2 / +4", font=_font(18, True), fill=EMERALD)
             for i, x in enumerate(positions):
-                active = i in (1, 3)
-                color = EMERALD if active else (220, 225, 232)
+                active = i in (1, 3); color = EMERALD if active else (220, 225, 232)
                 d.rounded_rectangle((x, 310, x + 96, 354), radius=9, fill=color)
                 d.text((x + 24, 323), f"K @ +{i+1}", font=_font(13, True), fill=(255,255,255) if active else MUTED)
             d.text((285, 370), "no second Transformer/MLP pass • no full-vocabulary jump matmul", font=_font(14, True), fill=MUTED)
-
         if step >= 24:
             d.text((42, 414), "4. Confidence-gated anchors → O(BK) gap filling", font=_font(17, True), fill=PURPLE)
             d.line((300, 440, 690, 440), fill=PURPLE, width=4)
             for x in (300, 430, 560, 690): d.ellipse((x-7, 433, x+7, 447), fill=PURPLE)
-
         if step >= 33:
             d.rounded_rectangle((250, 466, 766, 510), radius=10, fill=GREEN)
             d.text((354, 479), "TARGET verifies the proposal exactly", font=_font(16, True), fill=(255,255,255))
