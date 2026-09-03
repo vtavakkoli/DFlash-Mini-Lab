@@ -5,7 +5,7 @@ import json
 import os
 
 from .qwen17_benchmark import run_benchmark
-from .qwen17_runtime import Qwen17Runtime
+from .qwen17_runtime_safe import Qwen17Runtime
 
 
 def main() -> None:
