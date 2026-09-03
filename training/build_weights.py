@@ -14,6 +14,7 @@ from torch import nn
 
 SEED = 7
 BLOCK_SIZE = 4
+JUMP_OFFSETS = (2, 4)
 TOKEN_RE = re.compile(r"<eos>|[A-Za-z0-9]+|[^\w\s]")
 SENTENCES = ["one two three four five six seven eight nine ten .","the capital of austria is vienna .","vienna is the capital of austria .","the capital of france is paris .","the capital of italy is rome .","the quick brown fox jumps over the lazy dog .","machine learning models predict the next token .","language models generate text one token at a time .","speculative decoding proposes tokens then verifies them .","a draft model proposes several future tokens .","the target model verifies the proposed token block .","accepted draft tokens reduce expensive target model calls .","dflash predicts a draft block in parallel .","parallel drafting removes sequential draft latency .","dflash two keeps several candidates at every position .","a path selector chooses a coherent candidate sequence .","the verifier keeps correct tokens and fixes the first mismatch .","greedy speculative decoding can match greedy autoregressive decoding .","small models are useful for educational experiments .","benchmark speed quality acceptance and target forward passes ."]
 
@@ -76,6 +77,20 @@ class PairwisePathSelector(nn.Module):
         q = self.a(prev_tokens) * self.gate(context).unsqueeze(1); return torch.einsum("bkr,vr->bkv", q, self.b.weight) * self.scale
 
 
+class JumpAnchorHead(nn.Module):
+    """Cheap indexed future-token predictor used only for sparse +2/+4 anchors."""
+
+    def __init__(self, vocab_size: int, context_dim: int, offsets: tuple[int, ...] = JUMP_OFFSETS, d_model: int = 48):
+        super().__init__(); self.offsets = tuple(int(x) for x in offsets)
+        self.context_proj = nn.Linear(context_dim, d_model); self.offset_emb = nn.Embedding(BLOCK_SIZE + 1, d_model)
+        self.norm = nn.LayerNorm(d_model); self.head = nn.Linear(d_model, vocab_size)
+
+    def forward(self, context: torch.Tensor) -> torch.Tensor:
+        offsets = torch.tensor(self.offsets, dtype=torch.long, device=context.device)
+        h = self.context_proj(context).unsqueeze(1) + self.offset_emb(offsets).unsqueeze(0)
+        return self.head(self.norm(torch.tanh(h)))
+
+
 def random_lm_batch(tokens, batch_size, seq_len):
     starts = torch.randint(0, tokens.numel() - seq_len - 1, (batch_size,)); x = torch.stack([tokens[s:s+seq_len] for s in starts.tolist()]); y = torch.stack([tokens[s+1:s+seq_len+1] for s in starts.tolist()]); return x, y
 
@@ -84,35 +99,53 @@ def random_prefix_future_batch(tokens, batch_size, prefix_len, block_size):
     starts = torch.randint(0, tokens.numel() - prefix_len - block_size - 1, (batch_size,)); prefix = torch.stack([tokens[s:s+prefix_len] for s in starts.tolist()]); future = torch.stack([tokens[s+prefix_len:s+prefix_len+block_size] for s in starts.tolist()]); return prefix, future
 
 
-def build(output_dir: Path, target_steps: int, draft_steps: int, selector_steps: int) -> None:
+def build(output_dir: Path, target_steps: int, draft_steps: int, selector_steps: int, jump_steps: int) -> None:
     random.seed(SEED); np.random.seed(SEED); torch.manual_seed(SEED); torch.set_num_threads(1); torch.use_deterministic_algorithms(True)
-    text = make_corpus(); tok = WordTokenizer.from_text(text); target = TinyTransformerLM(len(tok.itos)); drafter = ParallelBlockDrafter(len(tok.itos), target_dim=target.d_model, block_size=BLOCK_SIZE); selector = PairwisePathSelector(len(tok.itos), context_dim=target.d_model * 2); ids = torch.tensor(tok.encode(text, add_bos=True), dtype=torch.long)
+    text = make_corpus(); tok = WordTokenizer.from_text(text)
+    target = TinyTransformerLM(len(tok.itos)); drafter = ParallelBlockDrafter(len(tok.itos), target_dim=target.d_model, block_size=BLOCK_SIZE)
+    selector = PairwisePathSelector(len(tok.itos), context_dim=target.d_model * 2); jump = JumpAnchorHead(len(tok.itos), context_dim=target.d_model * 2)
+    ids = torch.tensor(tok.encode(text, add_bos=True), dtype=torch.long)
+
     target.train(); opt = torch.optim.AdamW(target.parameters(), lr=2e-3)
     for _ in range(target_steps):
         x,y=random_lm_batch(ids,24,24); logits=target(x); loss=F.cross_entropy(logits.reshape(-1,len(tok.itos)),y.reshape(-1)); opt.zero_grad(); loss.backward(); opt.step()
     target.eval(); [p.requires_grad_(False) for p in target.parameters()]
+
     drafter.train(); opt=torch.optim.AdamW(drafter.parameters(),lr=2e-3)
     for _ in range(draft_steps):
         prefix,future=random_prefix_future_batch(ids,32,14,BLOCK_SIZE)
         with torch.no_grad(): context=target.cheap_context_features(prefix)
         logits=drafter(context); loss=F.cross_entropy(logits.reshape(-1,len(tok.itos)),future.reshape(-1)); opt.zero_grad(); loss.backward(); opt.step()
     drafter.eval(); [p.requires_grad_(False) for p in drafter.parameters()]
+
     selector.train(); opt=torch.optim.AdamW(selector.parameters(),lr=1.5e-3)
     for _ in range(selector_steps):
         prefix,future=random_prefix_future_batch(ids,32,14,BLOCK_SIZE)
         with torch.no_grad(): context=target.cheap_context_features(prefix); draft_logits=drafter(context)
         prev=torch.cat([prefix[:,-1:],future[:,:-1]],dim=1); corrected=draft_logits+selector.correction_logits(prev,context); loss=F.cross_entropy(corrected.reshape(-1,len(tok.itos)),future.reshape(-1)); opt.zero_grad(); loss.backward(); opt.step()
-    selector.eval(); output_dir.mkdir(parents=True,exist_ok=True); arrays={}
-    for section,model in (("target",target),("drafter",drafter),("selector",selector)):
+    selector.eval(); [p.requires_grad_(False) for p in selector.parameters()]
+
+    jump.train(); opt=torch.optim.AdamW(jump.parameters(),lr=2e-3)
+    jump_targets = torch.tensor([offset - 1 for offset in JUMP_OFFSETS], dtype=torch.long)
+    for _ in range(jump_steps):
+        prefix,future=random_prefix_future_batch(ids,32,14,BLOCK_SIZE)
+        with torch.no_grad(): context=target.cheap_context_features(prefix)
+        logits=jump(context); target_future=future[:, jump_targets]
+        loss=F.cross_entropy(logits.reshape(-1,len(tok.itos)),target_future.reshape(-1)); opt.zero_grad(); loss.backward(); opt.step()
+    jump.eval()
+
+    output_dir.mkdir(parents=True,exist_ok=True); arrays={}
+    for section,model in (("target",target),("drafter",drafter),("selector",selector),("jump",jump)):
         for name,value in model.state_dict().items(): arrays[f"{section}.{name}"]=value.detach().cpu().numpy().astype(np.float32)
+    arrays["jump_offsets"] = np.asarray(JUMP_OFFSETS, dtype=np.int64)
     np.savez_compressed(output_dir/"tiny_dflash_lab.npz",**arrays)
     (output_dir/"tokenizer.json").write_text(json.dumps({"stoi":tok.stoi,"itos":tok.itos},indent=2),encoding="utf-8")
-    manifest={"name":"tiny-dflash-cpu-reference","seed":SEED,"torch_builder_version":torch.__version__,"target":{"type":"causal Transformer","layers":2,"hidden_size":96,"heads":4},"drafter":{"type":"non-causal parallel block Transformer","layers":1,"hidden_size":64,"heads":4,"block_size":BLOCK_SIZE},"selector":{"type":"low-rank predecessor-conditioned selector","rank":32},"training_steps":{"target":target_steps,"drafter":draft_steps,"selector":selector_steps},"vocab_size":len(tok.itos),"weights_format":"NumPy NPZ float32"}
+    manifest={"name":"tiny-dflash-cpu-reference","seed":SEED,"torch_builder_version":torch.__version__,"target":{"type":"causal Transformer","layers":2,"hidden_size":96,"heads":4},"drafter":{"type":"non-causal parallel block Transformer","layers":1,"hidden_size":64,"heads":4,"block_size":BLOCK_SIZE},"selector":{"type":"low-rank predecessor-conditioned selector","rank":32},"jump":{"type":"indexed sparse future-token MLP head","hidden_size":48,"offsets":list(JUMP_OFFSETS)},"training_steps":{"target":target_steps,"drafter":draft_steps,"selector":selector_steps,"jump":jump_steps},"vocab_size":len(tok.itos),"weights_format":"NumPy NPZ float32"}
     (output_dir/"manifest.json").write_text(json.dumps(manifest,indent=2),encoding="utf-8"); print(f"wrote {output_dir/'tiny_dflash_lab.npz'}")
 
 
 def main() -> None:
-    p=argparse.ArgumentParser(); p.add_argument("--output-dir",default="models"); p.add_argument("--target-steps",type=int,default=500); p.add_argument("--draft-steps",type=int,default=450); p.add_argument("--selector-steps",type=int,default=250); args=p.parse_args(); build(Path(args.output_dir),args.target_steps,args.draft_steps,args.selector_steps)
+    p=argparse.ArgumentParser(); p.add_argument("--output-dir",default="models"); p.add_argument("--target-steps",type=int,default=500); p.add_argument("--draft-steps",type=int,default=450); p.add_argument("--selector-steps",type=int,default=250); p.add_argument("--jump-steps",type=int,default=250); args=p.parse_args(); build(Path(args.output_dir),args.target_steps,args.draft_steps,args.selector_steps,args.jump_steps)
 
 
 if __name__ == "__main__": main()
