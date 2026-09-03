@@ -18,6 +18,8 @@ class DecodeStats:
     proposed_draft_tokens: int
     wall_seconds: float
     selector_pair_scores: int = 0
+    jump_forward_passes: int = 0
+    jump_candidate_scores: int = 0
 
     @property
     def tokens_per_second(self) -> float:
@@ -35,6 +37,10 @@ class DecodeStats:
     def tokens_per_target_pass(self) -> float:
         return self.new_tokens / max(self.target_forward_passes, 1)
 
+    @property
+    def total_guidance_scores(self) -> int:
+        return self.selector_pair_scores + self.jump_candidate_scores
+
     def to_dict(self) -> dict:
         out = asdict(self)
         out.update(
@@ -42,6 +48,7 @@ class DecodeStats:
             latency_ms=self.latency_ms,
             acceptance_rate=self.acceptance_rate,
             tokens_per_target_pass=self.tokens_per_target_pass,
+            total_guidance_scores=self.total_guidance_scores,
         )
         return out
 
@@ -65,10 +72,12 @@ def _speculative_decode(
     method: str,
     top_k: int = 4,
     mobs_refine_passes: int = 1,
+    jump_weight: float = 0.5,
 ):
     seq = np.asarray(input_ids, dtype=np.int64).copy()
     start_len = int(seq.size)
     target_calls = draft_calls = accepted_total = proposed_total = selector_pair_scores = 0
+    jump_calls = jump_candidate_scores = 0
     t0 = time.perf_counter_ns()
     while int(seq.size) - start_len < max_new_tokens:
         remaining = max_new_tokens - (int(seq.size) - start_len)
@@ -91,6 +100,20 @@ def _speculative_decode(
                 refine_passes=mobs_refine_passes,
             )
             selector_pair_scores += int(pair_count)
+        elif method == "dflash4_jump_mobs":
+            jump_offsets, sparse_logits = runtime.jump_logits(context)
+            jump_calls += 1
+            proposal, pair_count, jump_count = runtime.dflash4_jump_mobs_select_path(
+                draft_logits,
+                jump_offsets,
+                sparse_logits,
+                context,
+                int(seq[-1]),
+                top_k=top_k,
+                jump_weight=jump_weight,
+            )
+            selector_pair_scores += int(pair_count)
+            jump_candidate_scores += int(jump_count)
         else:
             raise ValueError(f"unknown method: {method}")
         proposal = proposal[: min(int(proposal.size), remaining)]
@@ -118,6 +141,8 @@ def _speculative_decode(
         proposed_total,
         seconds,
         selector_pair_scores=selector_pair_scores,
+        jump_forward_passes=jump_calls,
+        jump_candidate_scores=jump_candidate_scores,
     )
 
 
@@ -143,4 +168,21 @@ def dflash3_mobs_decode(
         method="dflash3_mobs",
         top_k=top_k,
         mobs_refine_passes=refine_passes,
+    )
+
+
+def dflash4_jump_mobs_decode(
+    runtime: CpuReferenceRuntime,
+    input_ids,
+    max_new_tokens: int,
+    top_k: int = 4,
+    jump_weight: float = 0.5,
+):
+    return _speculative_decode(
+        runtime,
+        input_ids,
+        max_new_tokens,
+        method="dflash4_jump_mobs",
+        top_k=top_k,
+        jump_weight=jump_weight,
     )
