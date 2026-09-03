@@ -1,15 +1,16 @@
 # DFlash Mini Lab
 
-A reproducible **CPU-only speculative-decoding benchmark and visualization lab** for comparing five decoding mechanisms on the same tiny Transformer workload:
+A reproducible **CPU-only speculative-decoding benchmark and visualization lab** comparing six decoding mechanisms on the same tiny Transformer workload:
 
 1. **Normal autoregressive decoding**
-2. **DFlash-style parallel block speculative decoding**
-3. **DFlash v2-style multi-candidate dynamic-programming path selection**
+2. **DFlash-style** parallel block speculative decoding
+3. **DFlash v2-style** multi-candidate dynamic-programming path selection
 4. **DFlash3-MOBS** — experimental O(BK) middle-out bidirectional selection
 5. **DFlash4-JUMP-MOBS** — experimental sparse indexed future-token anchors + O(BK) gap filling
+6. **DFlash5-FUSED-JUMP-MOBS** — experimental shared-drafter, candidate-only sparse jump guidance with **zero extra jump forward pass**
 
 > [!IMPORTANT]
-> This repository is a **mechanism-level educational/reference implementation**, not the official DFlash/DFlash2 runtime or training recipe. DFlash3-MOBS and DFlash4-JUMP-MOBS are experiments introduced in this lab. Every speculative method uses the same target verifier, so final greedy output is checked against normal target-only decoding.
+> This repository is a **mechanism-level educational/reference implementation**, not the official DFlash/DFlash2 runtime or training recipe. DFlash3, DFlash4 and DFlash5 are experiments introduced in this lab. Every speculative path is verified by the same target model and checked against normal greedy output.
 
 ## Live benchmark
 
@@ -17,48 +18,65 @@ The GitHub Pages report is rebuilt from the CPU Docker benchmark and published o
 
 **https://vtavakkoli.github.io/DFlash-Mini-Lab/**
 
-The report contains the latest throughput/latency matrix, acceptance rate, target-pass efficiency, measured selector/guidance work, animated architecture explanation and interactive charts.
+The page includes the six-way throughput/latency matrix, acceptance, target-pass efficiency, measured guidance work, animated architecture and interactive charts.
 
-## DFlash4-JUMP-MOBS in one picture
+## DFlash5 in one picture
 
 ```text
 current context h_t
       │
-      ├──────────────► parallel drafter ─► top-k candidates at +1 +2 +3 +4
+      ▼
+parallel drafter ─────────────── one forward pass
       │
-      └──────────────► tiny jump head ───► approximate anchors at +2 and +4
-                                              │
-                            ┌─────────────────┘
-                            ▼
-                  lock sparse jump anchors
-                            │
-                  fill remaining gaps with
-                  adjacent O(BK) scoring
-                            │
-                            ▼
-                       TARGET VERIFY
-                            │
-                            ▼
-                    exact greedy output
+      ├── normal logits ───────► top-k candidates at +1 +2 +3 +4
+      │
+      └── shared hidden states
+                  │
+                  ▼
+          low-rank fused residual
+          only for top-k at +2/+4
+                  │
+                  ▼
+          confidence-gated anchors
+                  │
+          O(BK) local gap filling
+                  │
+                  ▼
+              TARGET VERIFY
+                  │
+                  ▼
+          exact greedy output
 ```
 
-The jump head is separately trained from the same deterministic corpus. It predicts future tokens directly from the current context plus an offset embedding. The CPU reference block size is 4, so the sparse jump offsets are `+2` and `+4`.
+DFlash5 specifically targets the bottleneck measured in DFlash4: DFlash4 improves speculative path quality but pays for a **separate jump-head forward pass**. DFlash5 trains a small low-rank residual from the already-computed drafter states and evaluates only retained candidates. The DFlash4 head can be used as a teacher during deterministic model building, but it is absent from DFlash5 inference.
+
+## Optimization strategy
+
+CI does not assume one fused weight is best. After building the deterministic Docker image once, it runs a bounded sweep of fused residual weight / confidence-margin settings on a short benchmark. It selects the fastest configuration that still satisfies:
+
+- exact output equivalence;
+- zero DFlash5 jump-network forward passes;
+- non-zero fused anchor use;
+- total DFlash5 guidance work below DFlash2.
+
+The selected configuration is then evaluated on the full workload: **8 prompts × 24 generated tokens × 5 measured repeats**. The sweep is saved as `dflash5-sweep.json` in the CI artifact and on GitHub Pages.
+
+The optimization history is intentionally preserved: removing duplicate top-k selection materially reduced DFlash5 overhead, while a later teacher-distillation experiment did not consistently improve acceptance. The repository reports those outcomes rather than tuning until one runner produces a desired ranking.
 
 ## Why measure guidance work?
 
-The lab does not assume a lower-complexity selector must be faster. DFlash2 evaluates an adjacent top-k transition grid with work proportional to **O(BK²)**. MOBS and JUMP-MOBS avoid the full `K × K` grid and keep local guidance proportional to **O(BK)** for a fixed sparse jump set.
+DFlash2 constructs adjacent top-k transition grids with selector work proportional to **O(BK²)**. MOBS and the jump variants avoid a full `K × K` grid.
 
-JUMP-MOBS therefore reports separately:
+For fixed sparse anchor count `J` and low-rank width `R`, DFlash5 guidance is approximately:
 
-- jump-head forward passes;
-- jump-anchor candidate scores;
-- local selector pair scores;
-- total guidance scores;
-- draft acceptance;
-- tokens per target verification pass;
-- end-to-end tokens/sec.
+```text
+candidate residual: O(JKR)
+gap filling:        O(BK)
+```
 
-This lets the benchmark expose cases where proposal quality improves but the extra jump-head inference cost still outweighs the benefit.
+The key runtime property is that the residual consumes **existing drafter states**; it does not add another Transformer/MLP forward pass.
+
+Lower guidance complexity alone does not guarantee higher tokens/sec. A cheaper selector can produce a weaker proposal and cause more target verification. The benchmark therefore reports both computation and proposal quality.
 
 ## One-command Docker benchmark
 
@@ -73,7 +91,9 @@ docker run --rm \
   dflash-mini-lab \
   --top-k 8 \
   --mobs-refine-passes 0 \
-  --jump-weight 0.5
+  --jump-weight 0.5 \
+  --fused-jump-weight 1.0 \
+  --fused-jump-min-margin 0.0
 ```
 
 Generated files:
@@ -86,9 +106,15 @@ reports/
 └── architecture.gif
 ```
 
+CI additionally publishes:
+
+```text
+dflash5-sweep.json
+```
+
 ## Local developer run
 
-Docker is recommended because it deterministically rebuilds all reference weights, including the jump head. For a local run:
+Docker is recommended because it deterministically rebuilds all reference weights.
 
 ```bash
 python -m venv .venv
@@ -98,40 +124,43 @@ python -m pip install torch==2.10.0 --index-url https://download.pytorch.org/whl
 python training/build_weights.py --output-dir models
 python -m pip install -e '.[test]'
 pytest
-CPU_THREADS=1 python -m dflash_mini_lab.cli --output-dir reports --top-k 8 --jump-weight 0.5
+CPU_THREADS=1 python -m dflash_mini_lab.cli \
+  --output-dir reports --top-k 8 \
+  --jump-weight 0.5 \
+  --fused-jump-weight 1.0
 ```
 
 ## Benchmark methodology
 
-GitHub CI currently uses:
+GitHub CI uses:
 
-- fixed set of 8 prompts;
-- 24 generated tokens per prompt;
+- 8 fixed prompts;
+- 24 generated tokens per prompt for the full run;
 - 1 warm-up iteration;
 - 5 measured repeats;
-- one CPU thread;
-- one target SLM and tokenizer for every mode;
+- one CPU/BLAS thread;
+- one target SLM and tokenizer for every method;
 - speculative block size 4;
-- top-k 8 for DFlash2/MOBS/JUMP-MOBS;
-- JUMP offsets `+2,+4`;
-- greedy decoding with exact-output verification.
+- top-k 8 for DFlash2/MOBS/JUMP variants;
+- sparse offsets `+2,+4`;
+- greedy decoding with exact target verification.
 
 > [!NOTE]
-> The tiny target recomputes the visible sequence at every target call and intentionally does not implement a production KV cache. Absolute throughput should **not** be compared directly with llama.cpp/vLLM/SGLang serving numbers. The pipeline is for controlled relative algorithm study and reproducibility.
+> The tiny target recomputes the visible sequence at every target call and intentionally does not implement a production KV cache. Absolute throughput should **not** be compared directly with llama.cpp/vLLM/SGLang serving numbers. This pipeline is for controlled relative algorithm study and reproducibility.
 
 ## Repository layout
 
 ```text
 benchmarks/prompts.json          fixed workload
-training/build_weights.py        deterministic target/drafter/selector/jump builder
+training/build_weights.py        deterministic target/drafter/selector/jump/fused builder
 models/                           generated weights/tokenizer (Docker build output)
 src/dflash_mini_lab/runtime.py   NumPy target + speculative runtimes
-src/dflash_mini_lab/decoding.py  five decoding modes + exact verifier correction
+src/dflash_mini_lab/decoding.py  six decoding modes + exact verifier correction
 src/dflash_mini_lab/benchmark.py metrics + exactness + guidance-work collection
 src/dflash_mini_lab/visuals.py   animated GIF generation
 src/dflash_mini_lab/report.py    self-contained interactive HTML report
 tests/                           exactness + complexity/artifact tests
-.github/workflows/               reproducible CPU CI + GitHub Pages deployment
+.github/workflows/               bounded optimization + CPU CI + GitHub Pages deployment
 ```
 
 ## References
