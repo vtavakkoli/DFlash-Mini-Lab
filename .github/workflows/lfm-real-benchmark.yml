@@ -57,14 +57,14 @@ jobs:
             python -m dflash_mini_lab.lfm_prepare \
               --model-id LiquidAI/LFM2.5-350M-Base \
               --output-dir /app/lfm-artifacts \
-              --max-seed-count 24 \
-              --generation-tokens 20 \
-              --top-candidate-k 24 \
+              --max-seed-count 40 \
+              --generation-tokens 32 \
+              --top-candidate-k 32 \
               --candidate-limit 2048 \
-              --drafter-steps 180 \
-              --selector-steps 100 \
-              --jump-steps 80 \
-              --fused-steps 100 \
+              --drafter-steps 300 \
+              --selector-steps 180 \
+              --jump-steps 120 \
+              --fused-steps 180 \
               --cpu-threads 2
 
       - name: Run eight-way real-model benchmark
