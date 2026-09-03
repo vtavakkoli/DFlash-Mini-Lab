@@ -1,0 +1,147 @@
+name: LFM2.5 real benchmark
+
+on:
+  pull_request:
+    paths:
+      - "Dockerfile.lfm"
+      - "real_benchmarks/**"
+      - "src/dflash_mini_lab/lfm_*.py"
+      - ".github/workflows/lfm-real-benchmark.yml"
+      - "pyproject.toml"
+  push:
+    branches: [main]
+    paths:
+      - "Dockerfile.lfm"
+      - "real_benchmarks/**"
+      - "src/dflash_mini_lab/lfm_*.py"
+      - ".github/workflows/lfm-real-benchmark.yml"
+      - "pyproject.toml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: "lfm-real-${{ github.ref }}"
+  cancel-in-progress: true
+
+jobs:
+  lfm-real-cpu:
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Restore Hugging Face model cache
+        uses: actions/cache@v4
+        with:
+          path: hf-cache
+          key: lfm25-350m-base-${{ runner.os }}-transformers5161-v1
+
+      - name: Build LFM CPU benchmark image
+        run: docker build -f Dockerfile.lfm -t dflash-lfm-real .
+
+      - name: Prepare LFM-generated distillation corpus and auxiliaries
+        run: |
+          mkdir -p hf-cache lfm-artifacts
+          docker run --rm \
+            -e HF_HOME=/cache \
+            -e CPU_THREADS=2 \
+            -e OMP_NUM_THREADS=2 \
+            -e MKL_NUM_THREADS=2 \
+            -e OPENBLAS_NUM_THREADS=2 \
+            -v "$PWD/hf-cache:/cache" \
+            -v "$PWD/lfm-artifacts:/app/lfm-artifacts" \
+            dflash-lfm-real \
+            python -m dflash_mini_lab.lfm_prepare \
+              --model-id LiquidAI/LFM2.5-350M-Base \
+              --output-dir /app/lfm-artifacts \
+              --max-seed-count 8 \
+              --generation-tokens 12 \
+              --candidate-limit 1024 \
+              --drafter-steps 80 \
+              --selector-steps 50 \
+              --jump-steps 40 \
+              --fused-steps 50 \
+              --cpu-threads 2
+
+      - name: Run eight-way real-model benchmark
+        run: |
+          mkdir -p lfm-reports
+          docker run --rm \
+            -e HF_HOME=/cache \
+            -e TRANSFORMERS_OFFLINE=1 \
+            -e HF_HUB_OFFLINE=1 \
+            -e CPU_THREADS=2 \
+            -e OMP_NUM_THREADS=2 \
+            -e MKL_NUM_THREADS=2 \
+            -e OPENBLAS_NUM_THREADS=2 \
+            -v "$PWD/hf-cache:/cache" \
+            -v "$PWD/lfm-artifacts:/app/lfm-artifacts:ro" \
+            -v "$PWD/lfm-reports:/app/lfm-reports" \
+            dflash-lfm-real \
+            python -m dflash_mini_lab.lfm_cli \
+              --aux /app/lfm-artifacts/lfm_aux.pt \
+              --prompts /app/real_benchmarks/prompts.json \
+              --output-dir /app/lfm-reports \
+              --tokens 6 \
+              --repeats 1 \
+              --prompt-limit 4 \
+              --top-k 8 \
+              --jump-weight 0.5 \
+              --fused-weight 1.0 \
+              --boltzmann-temperature 0.15 \
+              --bmobs-temperature 0.35 \
+              --cpu-threads 2 \
+              --dtype float32
+
+      - name: Validate real target and exactness
+        run: |
+          test -s lfm-artifacts/lfm_aux.pt
+          test -s lfm-artifacts/manifest.json
+          test -s lfm-artifacts/distillation.json
+          test -s lfm-reports/benchmark.json
+          test -s lfm-reports/report.html
+          python - <<'PY'
+          import json
+          d=json.load(open('lfm-reports/benchmark.json'))
+          assert d['model']['id'] == 'LiquidAI/LFM2.5-350M-Base'
+          assert d['model']['target_parameter_count'] > 300_000_000
+          assert d['model']['target_vocab_size'] == 65536
+          assert 1 < d['model']['candidate_size'] < d['model']['target_vocab_size']
+          assert d['mean_candidate_coverage'] > 0
+          expected=('normal','dflash','dflash2','dflash3_mobs','dflash4_jump_mobs','dflash5_fused_jump_mobs','dflash6_boltzmann','dflash6_bmobs')
+          for method in expected:
+              assert d['summary'][method]['all_exact'], method
+              assert d['summary'][method]['tokens_per_second_median'] > 0, method
+          assert d['summary']['normal']['mean_target_forward_passes'] == d['config']['max_new_tokens']
+          assert d['summary']['dflash6_boltzmann']['mean_total_guidance_scores'] > 0
+          assert d['summary']['dflash6_bmobs']['mean_total_guidance_scores'] > 0
+          print(json.dumps(d['summary'], indent=2))
+          PY
+
+      - name: Write benchmark summary
+        run: |
+          python - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json
+          d=json.load(open('lfm-reports/benchmark.json'))
+          print('# LFM2.5-350M-Base real benchmark')
+          print(f"Candidate vocabulary: {d['model']['candidate_size']} / {d['model']['target_vocab_size']}")
+          print(f"Mean candidate coverage: {100*d['mean_candidate_coverage']:.1f}%")
+          print('| Method | tok/s | speedup | acceptance | tokens/target pass |')
+          print('|---|---:|---:|---:|---:|')
+          for name,s in d['summary'].items():
+              print(f"| {name} | {s['tokens_per_second_median']:.3f} | {s['speedup_vs_normal']:.3f}x | {100*s['mean_acceptance_rate']:.1f}% | {s['mean_tokens_per_target_pass']:.2f} |")
+          PY
+
+      - name: Upload real benchmark artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: lfm25-350m-real-benchmark
+          path: |
+            lfm-reports/
+            lfm-artifacts/manifest.json
+            lfm-artifacts/distillation.json
+            lfm-artifacts/lfm_aux.pt
+          retention-days: 30
