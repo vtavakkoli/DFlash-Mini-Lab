@@ -1,142 +1,103 @@
 # Algorithm notes
 
-This repository is a **mechanism-level CPU reference lab**, not the upstream DFlash inference engine. It compares six decoding paths under one deterministic workload.
+This repository is a **mechanism-level CPU reference lab**, not the upstream DFlash inference engine. It compares eight decoding paths under one deterministic workload.
 
 ## 1. Normal autoregressive decoding
 
-For each output token the target SLM runs on the visible sequence, chooses the greedy next token and appends it. For `N` new tokens the reference path performs `N` target forward passes.
+For each output token the target SLM runs on the visible sequence, chooses the greedy next token and appends it.
 
 ## 2. DFlash reference mode
 
-A small non-causal drafter receives cheap context features derived from the target embedding table and predicts all positions of a future block in one draft forward pass. The target verifies the proposal in one pass, accepts the matching prefix and corrects the first mismatch.
-
-The upstream DFlash design uses a lightweight block-diffusion drafter conditioned on target hidden features. This lab preserves the parallel-draft → exact-target-verify mechanism at a tiny CPU scale.
+A small non-causal drafter predicts all positions of a future block in one forward pass. The target verifies the block, accepts the matching prefix and corrects the first mismatch.
 
 ## 3. DFlash v2 reference mode
 
-The DFlash2-style selector keeps top-k candidates at every draft position and uses learned low-rank predecessor-conditioned transition scores with dynamic programming.
-
-For block length `B` and top-k width `K`, measured transition work is approximately:
+The DFlash2-style selector retains top-k candidates at every position and uses learned predecessor-conditioned transition scores with dynamic programming. Guidance work is approximately:
 
 ```text
 K + (B - 1) * K^2
 ```
 
-so selector work grows as **O(BK²)**.
+or **O(BK²)**.
 
-## 4. Experimental DFlash3-MOBS
+## 4. DFlash3-MOBS
 
-**MOBS = Middle-Out Bidirectional Selection.** It avoids constructing the full `K × K` transition grid.
+MOBS chooses a central anchor and expands left/right, scoring only K candidates against already selected neighbors. With a fixed number of refinement passes its selector work is **O(BK)**.
 
-1. choose a reproducible pseudo-random central anchor;
-2. expand left and right;
-3. at each new position score only `K` candidates against selected neighbor(s);
-4. optionally run a fixed odd/even local refinement pass;
-5. send the path to the exact target verifier.
+## 5. DFlash4-JUMP-MOBS
 
-With a constant refinement count, core selector work is **O(BK)**. The CPU fast path disables refinement because earlier ablations showed its overhead did not consistently pay for itself.
+A separately trained jump head predicts sparse future anchors, then O(BK) local gap filling constructs the complete path. Its measured CPU weakness is the extra jump-head forward pass.
 
-## 5. Experimental DFlash4-JUMP-MOBS
+## 6. DFlash5-FUSED-JUMP-MOBS
 
-DFlash4 adds a separately trained indexed future-token head. For block size `B=4`, the jump offsets are `+2,+4`.
+DFlash5 reuses existing drafter hidden states and applies a low-rank residual only to retained top-k candidates at sparse offsets. It removes DFlash4's separate jump-forward pass while preserving exact target verification.
 
-Conceptually it models:
+## 7. DFlash6-Boltzmann
 
-```text
-P(x[t+j] | h_t, j)
-```
+DFlash6-Boltzmann is deliberately **training-free**. It uses only the draft logits already computed by DFlash.
 
-At each jump position, the choice is restricted to the drafter's top-k candidates and combines the draft score with the jump-head score. Those approximate anchors then seed O(BK) local gap filling.
+### Candidate distribution
 
-For a fixed sparse jump set `J`, guidance work is approximately:
+At each position it retains the drafter's top-k candidates. For candidate `c` with draft logit `z(c)` it conceptually samples from:
 
 ```text
-O(BK + JK)
+P(c) ∝ exp(z(c) / T_i)
 ```
 
-The weakness found by the CPU benchmark is that DFlash4 pays **one separate jump-head forward pass per speculative block**. The extra inference can erase the savings from better proposals.
-
-## 6. Experimental DFlash5-FUSED-JUMP-MOBS
-
-DFlash5 targets that measured DFlash4 bottleneck.
-
-### A. Reuse the existing drafter computation
-
-The normal parallel drafter already computes a hidden vector for every future block slot before projecting to vocabulary logits. DFlash5 exposes those normalized drafter hidden states:
+The implementation uses deterministic Gumbel-Max:
 
 ```text
-context
-   │
-   ▼
-parallel drafter ──► hidden(+1,+2,+3,+4)
-   │                       │
-   │                       └──► fused jump residual at +2/+4
-   ▼
-normal draft logits
+score(c) = z(c) / T_i + gumbel(context, position, token_id)
 ```
 
-There is **no second drafter/MLP/Transformer forward pass** for DFlash5.
+The Gumbel value is generated by a deterministic SplitMix64-style hash, so there is no mutable RNG state and the benchmark remains reproducible.
 
-### B. Candidate-only low-rank residual
+### Adaptive temperature
 
-At sparse positions `+2,+4`, a low-rank query is computed from the already-available drafter hidden state plus an offset embedding. It is scored only against the candidate codebook rows for the `K` tokens retained by the normal drafter.
-
-For sparse anchor count `J` and residual rank `R`, this extra scoring is:
+Temperature is reduced when the drafter is already confident. With margin
 
 ```text
-O(J*K*R)
+m_i = top1_logit - top2_logit
 ```
 
-rather than a full-vocabulary jump projection.
-
-### C. Teacher distillation is training-only
-
-The deterministic builder can train the fused residual using the stronger DFlash4 jump distribution as a teacher. The teacher contributes only during model building. At inference:
+the reference implementation uses an exponentially decreasing effective temperature:
 
 ```text
-DFlash4 jump forward passes: > 0
-DFlash5 jump forward passes:   0
+T_i = max(T_base * exp(-m_i), 0.02 * T_base)
 ```
 
-The benchmark records that difference explicitly.
+Thus high-margin positions approach ordinary DFlash argmax, while uncertain positions receive more exploration.
 
-### D. Confidence-gated anchors
+### Complexity
 
-DFlash5 combines the normal draft score with the fused residual at each sparse position. A configurable top-1/top-2 margin can reject weak anchors. If no fused anchor is retained, the method falls back to the MOBS path.
+The implementation evaluates deterministic Boltzmann scores only for the retained candidate set. For block length B and candidate width K, proposal-selection work is approximately **O(BK)**, with no learned selector and no additional model forward pass.
 
-A bounded CI sweep tests a fixed set of residual weights and margins and chooses the fastest configuration that remains exact and keeps guidance work below DFlash2.
+## 8. DFlash6-BMOBS
 
-### E. O(BK) gap filling and exact verification
+BMOBS combines Boltzmann exploration with the previously tested middle-out linear selector.
 
-Once fused anchors are selected, missing positions are filled using the same adjacent-neighbor O(BK) mechanism as JUMP-MOBS. The complete proposal still goes through the target verifier. No fused/jump prediction is emitted directly.
+1. retain top-k candidates at every position;
+2. for an even block, compare the two central positions and choose the one with the smaller top-1/top-2 margin;
+3. use deterministic Boltzmann/Gumbel scoring to select one anchor candidate there;
+4. fill the remaining positions using the existing O(BK) adjacent-neighbor MOBS mechanism;
+5. pass the complete proposal to the exact target verifier.
 
-## What the benchmark tests
+This is designed to spend stochastic/exploration work at one uncertain middle anchor rather than sampling every slot.
 
-The useful objective is not merely low selector complexity. It is:
+## Exactness
 
-```text
-verified output tokens / total decode time
-```
+Boltzmann proposals are approximate and can be wrong. Neither DFlash6 mode emits them directly. The target model verifies the proposal and corrects the first mismatch, so tests compare each final greedy sequence with normal target-only decoding.
 
-The report therefore includes:
+## What the first DFlash6 benchmark found
 
-- median tokens/sec and latency;
-- draft acceptance;
-- tokens per target pass;
-- target/draft/jump forward-pass counts;
-- local selector pair scores;
-- jump/fused candidate scores;
-- fused-anchor count;
-- total guidance scores;
-- exact-output equivalence.
+The first full CI experiment selected base temperatures 0.35 for Boltzmann and 0.20 for BMOBS. Relative to plain DFlash on that runner:
 
-This exposes three different failure modes:
+- Boltzmann increased acceptance by about **2.7 percentage points**;
+- BMOBS increased acceptance by about **5.4 percentage points**;
+- BMOBS approached DFlash2/MOBS target-pass efficiency with substantially less guidance work than DFlash2;
+- both remained slower in end-to-end CPU tokens/sec because candidate extraction, deterministic Gumbel calculations and (for BMOBS) neighbor scoring cost more than the verification work saved.
 
-1. low guidance cost but weak speculative paths;
-2. strong paths but expensive extra inference, as seen with DFlash4;
-3. cheap fused guidance whose proposal-quality gain is too small to beat simpler methods.
-
-The project preserves those negative results rather than tuning until a benchmark happens to rank a new method first.
+The repository intentionally preserves this result rather than claiming that better acceptance automatically means faster decoding.
 
 ## Complexity summary
 
@@ -145,12 +106,10 @@ Normal:                 O(N) target passes for N output tokens
 DFlash:                 parallel draft + target verification
 DFlash2 selector:       O(BK^2)
 DFlash3-MOBS:           O(BK)
-DFlash4-JUMP-MOBS:      O(BK + JK) plus a separate jump-head forward
-DFlash5-FUSED-JUMP:     O(BK + JKR), no separate jump-head forward
+DFlash4-JUMP-MOBS:      O(BK + JK) plus separate jump inference
+DFlash5-FUSED-JUMP:     O(BK + JKR), no separate jump inference
+DFlash6-Boltzmann:      O(BK), no learned selector/model pass
+DFlash6-BMOBS:          O(BK), one Boltzmann anchor + linear fill
 ```
 
-These statements refer to path-guidance candidate scoring in this reference implementation, not total Transformer inference complexity.
-
-## Exactness guarantee
-
-Tests and CI compare the complete greedy token sequence from all speculative modes against the normal target-only greedy sequence. The speculative proposal is never emitted without target verification/correction.
+These statements describe path-guidance candidate scoring in this reference implementation, not total Transformer inference complexity.
