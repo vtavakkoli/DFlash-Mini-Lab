@@ -1,0 +1,217 @@
+name: Qwen3-1.7B all methods
+
+on:
+  pull_request:
+    paths:
+      - "Dockerfile.qwen17"
+      - "qwen_benchmarks/**"
+      - "src/dflash_mini_lab/qwen17_*.py"
+      - ".github/workflows/qwen17-all-methods.yml"
+      - "README.md"
+  push:
+    branches: [main]
+    paths:
+      - "Dockerfile.qwen17"
+      - "qwen_benchmarks/**"
+      - "src/dflash_mini_lab/qwen17_*.py"
+      - ".github/workflows/qwen17-all-methods.yml"
+      - "README.md"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: "qwen17-all-${{ github.ref }}"
+  cancel-in-progress: true
+
+jobs:
+  qwen17-real-cpu:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Restore Qwen3-1.7B Hugging Face cache
+        uses: actions/cache@v4
+        with:
+          path: hf-qwen17-cache
+          key: qwen3-17b-base-${{ runner.os }}-transformers5161-v1
+
+      - name: Build Qwen3-1.7B benchmark image
+        run: docker build -f Dockerfile.qwen17 -t dflash-qwen17 .
+
+      - name: Train ~10x hidden-fusion corpus and all auxiliary heads
+        run: |
+          mkdir -p hf-qwen17-cache qwen17-artifacts
+          docker run --rm \
+            -e HF_HOME=/cache \
+            -e CPU_THREADS=2 -e OMP_NUM_THREADS=2 -e MKL_NUM_THREADS=2 -e OPENBLAS_NUM_THREADS=2 \
+            -v "$PWD/hf-qwen17-cache:/cache" \
+            -v "$PWD/qwen17-artifacts:/app/qwen17-artifacts" \
+            dflash-qwen17 \
+            python -m dflash_mini_lab.qwen17_prepare \
+              --model-id Qwen/Qwen3-1.7B-Base \
+              --seeds /app/qwen_benchmarks/train_seeds.json \
+              --output-dir /app/qwen17-artifacts \
+              --max-seed-count 32 \
+              --generation-tokens 100 \
+              --teacher-batch-size 4 \
+              --top-candidate-k 32 \
+              --candidate-limit 8192 \
+              --layer-ids 4 14 27 \
+              --memory-tokens 16 \
+              --block-size 6 \
+              --draft-dim 256 \
+              --draft-layers 2 \
+              --drafter-steps 320 \
+              --selector-steps 160 \
+              --jump-steps 140 \
+              --fused-steps 140 \
+              --train-batch-size 8 \
+              --cpu-threads 2
+
+      - name: Run nine-way cached Qwen3-1.7B benchmark
+        run: |
+          mkdir -p qwen17-reports
+          docker run --rm \
+            -e HF_HOME=/cache \
+            -e TRANSFORMERS_OFFLINE=1 -e HF_HUB_OFFLINE=1 \
+            -e CPU_THREADS=2 -e OMP_NUM_THREADS=2 -e MKL_NUM_THREADS=2 -e OPENBLAS_NUM_THREADS=2 \
+            -v "$PWD/hf-qwen17-cache:/cache" \
+            -v "$PWD/qwen17-artifacts:/app/qwen17-artifacts:ro" \
+            -v "$PWD/qwen17-reports:/app/qwen17-reports" \
+            dflash-qwen17 \
+            python -m dflash_mini_lab.qwen17_cli \
+              --aux /app/qwen17-artifacts/qwen17_all_methods.pt \
+              --model-id Qwen/Qwen3-1.7B-Base \
+              --prompts /app/qwen_benchmarks/prompts.json \
+              --calibration-prompts /app/qwen_benchmarks/calibration_prompts.json \
+              --output-dir /app/qwen17-reports \
+              --tokens 16 \
+              --repeats 1 \
+              --prompt-limit 6 \
+              --calibration-tokens 8 \
+              --calibration-prompt-limit 2 \
+              --top-k 8 \
+              --cpu-threads 2 \
+              --dtype bfloat16
+
+      - name: Validate model, 10x training scale, exactness and method instrumentation
+        run: |
+          test -s qwen17-artifacts/qwen17_all_methods.pt
+          test -s qwen17-artifacts/manifest.json
+          test -s qwen17-reports/benchmark.json
+          test -s qwen17-reports/report.html
+          python - <<'PY'
+          import json
+          d=json.load(open('qwen17-reports/benchmark.json'))
+          assert d['model']['id']=='Qwen/Qwen3-1.7B-Base'
+          assert 1_500_000_000 < d['model']['target_parameter_count'] < 2_000_000_000
+          assert d['model']['target_hidden_size']==2048
+          assert d['model']['target_vocab_size']==151936
+          assert d['model']['target_layer_ids']==[4,14,27]
+          assert d['model']['dtype']=='bfloat16'
+          m=d['training_metadata']
+          assert m['distillation_seed_count']==32
+          assert m['generation_tokens_per_seed']==100
+          assert 3000 <= m['constructed_training_examples'] <= 3100
+          assert m['training_scale_vs_qwen06'] >= 9.5
+          assert 512 < d['model']['candidate_size'] <= 8192
+          assert d['mean_candidate_coverage'] > 0.50
+          methods=('normal_cached','dflash','dflash2','dflash3_mobs','dflash4_jump_mobs','dflash5_fused_jump_mobs','dflash6_boltzmann','dflash6_bmobs','dflash7_act')
+          for method in methods:
+              s=d['summary'][method]
+              assert s['all_exact'], method
+              assert s['tokens_per_second_median'] > 0, method
+          assert d['summary']['dflash2']['mean_selector_pair_scores'] > 0
+          assert d['summary']['dflash3_mobs']['mean_selector_pair_scores'] > 0
+          assert d['summary']['dflash4_jump_mobs']['mean_jump_candidate_scores'] > 0
+          assert d['summary']['dflash5_fused_jump_mobs']['mean_fused_candidate_scores'] > 0
+          assert d['summary']['dflash6_boltzmann']['mean_boltzmann_candidate_scores'] > 0
+          assert d['summary']['dflash6_bmobs']['mean_boltzmann_candidate_scores'] > 0
+          assert d['winner']['method'] in methods
+          print(json.dumps({'winner':d['winner'],'training_scale':m['training_scale_vs_qwen06'],'summary':d['summary']},indent=2))
+          PY
+
+      - name: Write Qwen3-1.7B comparison summary
+        run: |
+          python - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json
+          d=json.load(open('qwen17-reports/benchmark.json'))
+          print('# Qwen3-1.7B-Base — all DFlash lab methods')
+          print(f"Training examples: {d['training_metadata']['constructed_training_examples']} ({d['training_metadata']['training_scale_vs_qwen06']:.2f}x Qwen0.6 experiment)")
+          print(f"Candidate coverage: {100*d['mean_candidate_coverage']:.1f}%")
+          print(f"Winner: **{d['winner']['method']}** — {d['winner']['tokens_per_second']:.3f} tok/s ({d['winner']['speedup_vs_normal']:.3f}x normal)")
+          print('| Method | tok/s | vs normal | acceptance | target calls | target input tokens | exact |')
+          print('|---|---:|---:|---:|---:|---:|:---:|')
+          for method,s in d['summary'].items():
+              print(f"| {method} | {s['tokens_per_second_median']:.3f} | {s['speedup_vs_normal']:.3f}x | {100*s['mean_acceptance_rate']:.1f}% | {s['mean_target_forward_passes']:.2f} | {s['mean_target_input_tokens']:.2f} | {'yes' if s['all_exact'] else 'no'} |")
+          PY
+
+      - name: Upload Qwen3-1.7B all-method artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: qwen3-17b-all-methods-benchmark
+          path: |
+            qwen17-reports/
+            qwen17-artifacts/manifest.json
+            qwen17-artifacts/distillation.json
+            qwen17-artifacts/qwen17_all_methods.pt
+          retention-days: 30
+
+      - name: Prepare combined benchmark Pages site
+        if: github.event_name != 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          rm -rf pages /tmp/tiny /tmp/q06 && mkdir -p pages/qwen17
+          cp qwen17-reports/report.html pages/qwen17/index.html
+          cp qwen17-reports/report.html pages/qwen17/report.html
+          cp qwen17-reports/benchmark.json pages/qwen17/benchmark.json
+          cp qwen17-artifacts/manifest.json pages/qwen17/manifest.json
+          fetch_artifact () {
+            name="$1"; dest="$2"; zip="$3"
+            id=$(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts?name=$name&per_page=20" --jq '.artifacts | map(select(.expired==false)) | .[0].id // empty')
+            if [ -n "$id" ]; then
+              mkdir -p "$dest"
+              gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$id/zip" > "$zip"
+              unzip -q "$zip" -d "$dest"
+            fi
+          }
+          fetch_artifact dflash-cpu-report /tmp/tiny /tmp/tiny.zip || true
+          fetch_artifact qwen3-06b-dflash7-benchmark /tmp/q06 /tmp/q06.zip || true
+          if [ -s /tmp/tiny/report.html ]; then mkdir -p pages/tiny; cp -r /tmp/tiny/* pages/tiny/; fi
+          if [ -s /tmp/q06/qwen-reports/report.html ]; then mkdir -p pages/qwen06; cp -r /tmp/q06/qwen-reports/* pages/qwen06/; fi
+          python - <<'PY'
+          import json,html
+          d=json.load(open('qwen17-reports/benchmark.json')); w=d['winner']; s=d['summary'][w['method']]
+          open('pages/index.html','w').write(f'''<!doctype html><html><head><meta charset="utf-8"><title>DFlash Mini Lab benchmarks</title><style>body{{font-family:system-ui;max-width:900px;margin:50px auto;padding:0 20px}}a{{font-size:1.1rem}}.card{{padding:18px;border:1px solid #ddd;border-radius:12px;margin:16px 0}}</style></head><body><h1>DFlash Mini Lab — verified benchmarks</h1><div class="card"><h2>Qwen3-1.7B-Base · all methods</h2><p>Winner: <b>{html.escape(w['method'])}</b> — {s['tokens_per_second_median']:.3f} tok/s ({s['speedup_vs_normal']:.3f}× normal).</p><p><a href="qwen17/">Open the Qwen3-1.7B nine-way report →</a></p></div><div class="card"><h2>Earlier experiments</h2><p><a href="qwen06/">Qwen3-0.6B DFlash7 report</a> · <a href="tiny/">Tiny CPU eight-way report</a></p></div></body></html>''')
+          PY
+          touch pages/.nojekyll
+
+      - name: Upload GitHub Pages artifact
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: pages
+
+  deploy-pages:
+    if: github.event_name != 'pull_request'
+    needs: qwen17-real-cpu
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      pages: write
+      id-token: write
+      actions: read
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy combined benchmark site
+        id: deployment
+        uses: actions/deploy-pages@v4
