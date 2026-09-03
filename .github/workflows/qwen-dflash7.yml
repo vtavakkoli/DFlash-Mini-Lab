@@ -1,0 +1,148 @@
+name: Qwen3 DFlash7 benchmark
+
+on:
+  pull_request:
+    paths:
+      - "Dockerfile.qwen"
+      - "qwen_benchmarks/**"
+      - "src/dflash_mini_lab/qwen_*.py"
+      - ".github/workflows/qwen-dflash7.yml"
+      - "README.md"
+  push:
+    branches: [main]
+    paths:
+      - "Dockerfile.qwen"
+      - "qwen_benchmarks/**"
+      - "src/dflash_mini_lab/qwen_*.py"
+      - ".github/workflows/qwen-dflash7.yml"
+      - "README.md"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: "qwen-dflash7-${{ github.ref }}"
+  cancel-in-progress: true
+
+jobs:
+  qwen-real-cpu:
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Restore Qwen Hugging Face cache
+        uses: actions/cache@v4
+        with:
+          path: hf-qwen-cache
+          key: qwen3-06b-base-${{ runner.os }}-transformers5161-v1
+
+      - name: Build Qwen DFlash7 CPU image
+        run: docker build -f Dockerfile.qwen -t dflash-qwen7 .
+
+      - name: Train hidden-fusion DFlash auxiliary
+        run: |
+          mkdir -p hf-qwen-cache qwen-artifacts
+          docker run --rm \
+            -e HF_HOME=/cache \
+            -e CPU_THREADS=2 -e OMP_NUM_THREADS=2 -e MKL_NUM_THREADS=2 -e OPENBLAS_NUM_THREADS=2 \
+            -v "$PWD/hf-qwen-cache:/cache" \
+            -v "$PWD/qwen-artifacts:/app/qwen-artifacts" \
+            dflash-qwen7 \
+            python -m dflash_mini_lab.qwen_prepare \
+              --model-id Qwen/Qwen3-0.6B-Base \
+              --seeds /app/qwen_benchmarks/train_seeds.json \
+              --output-dir /app/qwen-artifacts \
+              --max-seed-count 24 \
+              --generation-tokens 18 \
+              --top-candidate-k 32 \
+              --candidate-limit 8192 \
+              --layer-ids 4 14 27 \
+              --memory-tokens 16 \
+              --block-size 6 \
+              --draft-dim 256 \
+              --draft-layers 2 \
+              --train-steps 180 \
+              --cpu-threads 2
+
+      - name: Run cached Qwen DFlash7 benchmark
+        run: |
+          mkdir -p qwen-reports
+          docker run --rm \
+            -e HF_HOME=/cache \
+            -e TRANSFORMERS_OFFLINE=1 -e HF_HUB_OFFLINE=1 \
+            -e CPU_THREADS=2 -e OMP_NUM_THREADS=2 -e MKL_NUM_THREADS=2 -e OPENBLAS_NUM_THREADS=2 \
+            -v "$PWD/hf-qwen-cache:/cache" \
+            -v "$PWD/qwen-artifacts:/app/qwen-artifacts:ro" \
+            -v "$PWD/qwen-reports:/app/qwen-reports" \
+            dflash-qwen7 \
+            python -m dflash_mini_lab.qwen_cli \
+              --aux /app/qwen-artifacts/qwen_dflash.pt \
+              --model-id Qwen/Qwen3-0.6B-Base \
+              --prompts /app/qwen_benchmarks/prompts.json \
+              --calibration-prompts /app/qwen_benchmarks/calibration_prompts.json \
+              --output-dir /app/qwen-reports \
+              --tokens 12 \
+              --repeats 2 \
+              --prompt-limit 6 \
+              --calibration-tokens 8 \
+              --cpu-threads 2 \
+              --dtype float32
+
+      - name: Validate Qwen target, cache semantics and exactness
+        run: |
+          test -s qwen-artifacts/qwen_dflash.pt
+          test -s qwen-artifacts/manifest.json
+          test -s qwen-reports/benchmark.json
+          test -s qwen-reports/report.html
+          python - <<'PY'
+          import json
+          d=json.load(open('qwen-reports/benchmark.json'))
+          assert d['model']['id'] == 'Qwen/Qwen3-0.6B-Base'
+          assert d['model']['target_parameter_count'] > 500_000_000
+          assert d['model']['target_vocab_size'] == 151936
+          assert d['model']['target_hidden_size'] == 1024
+          assert d['model']['target_layer_ids'] == [4,14,27]
+          assert 256 < d['model']['candidate_size'] <= 8192
+          assert d['mean_candidate_coverage'] > 0
+          for method in ('normal_cached','dflash_qwen','dflash7_act'):
+              s=d['summary'][method]
+              assert s['all_exact'], method
+              assert s['tokens_per_second_median'] > 0, method
+          normal=d['summary']['normal_cached']
+          base=d['summary']['dflash_qwen']
+          v7=d['summary']['dflash7_act']
+          assert base['mean_target_forward_passes'] <= normal['mean_target_forward_passes']
+          assert v7['mean_target_forward_passes'] <= normal['mean_target_forward_passes']
+          assert d['config']['cache'].startswith('Hugging Face DynamicCache')
+          assert d['config']['anchor'].startswith('known greedy bonus token')
+          print(json.dumps(d['summary'], indent=2))
+          PY
+
+      - name: Write Qwen result summary
+        run: |
+          python - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json
+          d=json.load(open('qwen-reports/benchmark.json'))
+          print('# Qwen3-0.6B-Base — DFlash7-ACT')
+          print(f"Candidate coverage: {100*d['mean_candidate_coverage']:.1f}%")
+          print(f"Selected V7 margin threshold: {d['config']['v7_margin_threshold']:.2f}")
+          print('| Method | tok/s | speedup | draft acceptance | target calls | target input tokens |')
+          print('|---|---:|---:|---:|---:|---:|')
+          for method in ('normal_cached','dflash_qwen','dflash7_act'):
+              s=d['summary'][method]
+              print(f"| {method} | {s['tokens_per_second_median']:.3f} | {s['speedup_vs_normal']:.3f}x | {100*s['mean_acceptance_rate']:.1f}% | {s['mean_target_forward_passes']:.2f} | {s['mean_target_input_tokens']:.2f} |")
+          PY
+
+      - name: Upload Qwen DFlash7 artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: qwen3-06b-dflash7-benchmark
+          path: |
+            qwen-reports/
+            qwen-artifacts/manifest.json
+            qwen-artifacts/distillation.json
+            qwen-artifacts/qwen_dflash.pt
+          retention-days: 30
