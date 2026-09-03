@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Iterable
 
 import torch
 import torch.nn.functional as F
@@ -20,7 +19,8 @@ class AuxConfig:
     target_vocab_size: int
     candidate_size: int
     block_size: int = BLOCK_SIZE
-    drafter_dim: int = 96
+    context_tokens: int = 4
+    drafter_dim: int = 128
     drafter_heads: int = 4
     selector_rank: int = 16
     jump_dim: int = 48
@@ -28,9 +28,9 @@ class AuxConfig:
 
     @property
     def context_dim(self) -> int:
-        # Same cheap conditioning family as the tiny lab: last frozen target
-        # embedding concatenated with the mean frozen target embedding.
-        return self.target_hidden_size * 2
+        # Preserve local word order without a target forward: flatten the most
+        # recent frozen input embeddings, then append the prefix mean embedding.
+        return self.target_hidden_size * (self.context_tokens + 1)
 
 
 class CompactParallelDrafter(nn.Module):
@@ -130,30 +130,47 @@ class TrainingTensors:
 
 
 def make_training_tensors(
-    sequences: Iterable[list[int]],
+    sequences: list[list[int]],
     embedding_weight: torch.Tensor,
     candidate_ids: list[int],
+    *,
+    training_start_indices: list[int] | None = None,
     block_size: int = BLOCK_SIZE,
+    context_tokens: int = 4,
 ) -> TrainingTensors:
-    """Build cached training examples without additional target-model forwards."""
+    """Cache exact teacher-trajectory examples without extra target forwards.
+
+    ``training_start_indices`` is the number of prompt tokens in each generated
+    sequence. When supplied, examples begin at the final prompt token, so all
+    future labels come from the LFM greedy trajectory rather than human prompt
+    text.
+    """
     local = {int(tok): i for i, tok in enumerate(candidate_ids)}
     contexts: list[torch.Tensor] = []
     futures: list[list[int]] = []
     prevs: list[list[int]] = []
     emb = embedding_weight.detach().float().cpu()
+    starts = training_start_indices or [1] * len(sequences)
+    if len(starts) != len(sequences):
+        raise ValueError("training_start_indices must match sequences")
 
-    for seq_list in sequences:
+    for seq_list, prompt_len in zip(sequences, starts):
         seq = torch.tensor(seq_list, dtype=torch.long)
         if seq.numel() <= block_size + 1:
             continue
         seq_emb = emb[seq]
         cumulative = seq_emb.cumsum(dim=0)
-        for end in range(0, int(seq.numel()) - block_size):
+        first_end = max(0, int(prompt_len) - 1)
+        for end in range(first_end, int(seq.numel()) - block_size):
             future_target = [int(x) for x in seq[end + 1 : end + 1 + block_size].tolist()]
             if any(tok not in local for tok in future_target):
                 continue
             mean = cumulative[end] / float(end + 1)
-            contexts.append(torch.cat([seq_emb[end], mean], dim=-1))
+            recent = seq_emb[max(0, end - context_tokens + 1) : end + 1]
+            if int(recent.shape[0]) < context_tokens:
+                pad = torch.zeros(context_tokens - int(recent.shape[0]), int(seq_emb.shape[1]), dtype=seq_emb.dtype)
+                recent = torch.cat([pad, recent], dim=0)
+            contexts.append(torch.cat([recent.reshape(-1), mean], dim=-1))
             futures.append([local[tok] for tok in future_target])
             prevs.append([int(seq[end])] + future_target[:-1])
 
@@ -176,10 +193,10 @@ def train_auxiliary_models(
     tensors: TrainingTensors,
     *,
     seed: int = 7,
-    drafter_steps: int = 140,
-    selector_steps: int = 90,
-    jump_steps: int = 70,
-    fused_steps: int = 90,
+    drafter_steps: int = 180,
+    selector_steps: int = 100,
+    jump_steps: int = 80,
+    fused_steps: int = 100,
     batch_size: int = 32,
 ) -> tuple[CompactParallelDrafter, PairwisePathSelector, CompactJumpHead, CompactFusedResidual, dict]:
     torch.manual_seed(seed)
@@ -191,117 +208,58 @@ def train_auxiliary_models(
     jump = CompactJumpHead(config)
     fused = CompactFusedResidual(config)
 
-    drafter.train()
-    opt = torch.optim.AdamW(drafter.parameters(), lr=2e-3)
-    last_draft_loss = 0.0
+    drafter.train(); opt = torch.optim.AdamW(drafter.parameters(), lr=2e-3); last_draft_loss = 0.0
     for _ in range(max(1, int(drafter_steps))):
         idx = _batch_indices(len(tensors), batch_size, generator)
         logits = drafter(tensors.context[idx])
         loss = F.cross_entropy(logits.reshape(-1, config.candidate_size), tensors.future_local[idx].reshape(-1))
-        opt.zero_grad(set_to_none=True); loss.backward(); opt.step()
-        last_draft_loss = float(loss.detach())
+        opt.zero_grad(set_to_none=True); loss.backward(); opt.step(); last_draft_loss = float(loss.detach())
     drafter.eval()
-    for p in drafter.parameters():
-        p.requires_grad_(False)
+    for p in drafter.parameters(): p.requires_grad_(False)
 
-    selector.train()
-    opt = torch.optim.AdamW(selector.parameters(), lr=1.5e-3)
-    last_selector_loss = 0.0
+    selector.train(); opt = torch.optim.AdamW(selector.parameters(), lr=1.5e-3); last_selector_loss = 0.0
     for _ in range(max(1, int(selector_steps))):
-        idx = _batch_indices(len(tensors), batch_size, generator)
-        context = tensors.context[idx]
-        with torch.no_grad():
-            base = drafter(context)
+        idx = _batch_indices(len(tensors), batch_size, generator); context = tensors.context[idx]
+        with torch.no_grad(): base = drafter(context)
         corrected = base + selector.candidate_correction(tensors.prev_target[idx], context, candidates)
         loss = F.cross_entropy(corrected.reshape(-1, config.candidate_size), tensors.future_local[idx].reshape(-1))
-        opt.zero_grad(set_to_none=True); loss.backward(); opt.step()
-        last_selector_loss = float(loss.detach())
+        opt.zero_grad(set_to_none=True); loss.backward(); opt.step(); last_selector_loss = float(loss.detach())
     selector.eval()
-    for p in selector.parameters():
-        p.requires_grad_(False)
+    for p in selector.parameters(): p.requires_grad_(False)
 
-    jump.train()
-    opt = torch.optim.AdamW(jump.parameters(), lr=2e-3)
-    jump_positions = torch.tensor([offset - 1 for offset in JUMP_OFFSETS], dtype=torch.long)
-    last_jump_loss = 0.0
+    jump.train(); opt = torch.optim.AdamW(jump.parameters(), lr=2e-3); jump_positions = torch.tensor([offset - 1 for offset in JUMP_OFFSETS], dtype=torch.long); last_jump_loss = 0.0
     for _ in range(max(1, int(jump_steps))):
-        idx = _batch_indices(len(tensors), batch_size, generator)
-        logits = jump(tensors.context[idx])
-        targets = tensors.future_local[idx][:, jump_positions]
+        idx = _batch_indices(len(tensors), batch_size, generator); logits = jump(tensors.context[idx]); targets = tensors.future_local[idx][:, jump_positions]
         loss = F.cross_entropy(logits.reshape(-1, config.candidate_size), targets.reshape(-1))
-        opt.zero_grad(set_to_none=True); loss.backward(); opt.step()
-        last_jump_loss = float(loss.detach())
+        opt.zero_grad(set_to_none=True); loss.backward(); opt.step(); last_jump_loss = float(loss.detach())
     jump.eval()
-    for p in jump.parameters():
-        p.requires_grad_(False)
+    for p in jump.parameters(): p.requires_grad_(False)
 
-    fused.train()
-    opt = torch.optim.AdamW(fused.parameters(), lr=1.5e-3)
-    last_fused_loss = 0.0
+    fused.train(); opt = torch.optim.AdamW(fused.parameters(), lr=1.5e-3); last_fused_loss = 0.0
     for _ in range(max(1, int(fused_steps))):
-        idx = _batch_indices(len(tensors), batch_size, generator)
-        context = tensors.context[idx]
+        idx = _batch_indices(len(tensors), batch_size, generator); context = tensors.context[idx]
         with torch.no_grad():
-            hidden = drafter.encode(context)
-            base = drafter.head(hidden)[:, jump_positions]
-            teacher = base + 0.5 * jump(context)
-            teacher_probs = F.softmax(teacher.reshape(-1, config.candidate_size), dim=-1)
-        student = base + fused.residual_logits(hidden)
-        flat = student.reshape(-1, config.candidate_size)
-        targets = tensors.future_local[idx][:, jump_positions].reshape(-1)
-        ce = F.cross_entropy(flat, targets)
-        kl = F.kl_div(F.log_softmax(flat, dim=-1), teacher_probs, reduction="batchmean")
-        loss = 0.7 * ce + 0.3 * kl
-        opt.zero_grad(set_to_none=True); loss.backward(); opt.step()
-        last_fused_loss = float(loss.detach())
+            hidden = drafter.encode(context); base = drafter.head(hidden)[:, jump_positions]; teacher = base + 0.5 * jump(context); teacher_probs = F.softmax(teacher.reshape(-1, config.candidate_size), dim=-1)
+        student = base + fused.residual_logits(hidden); flat = student.reshape(-1, config.candidate_size); targets = tensors.future_local[idx][:, jump_positions].reshape(-1)
+        ce = F.cross_entropy(flat, targets); kl = F.kl_div(F.log_softmax(flat, dim=-1), teacher_probs, reduction="batchmean"); loss = 0.7 * ce + 0.3 * kl
+        opt.zero_grad(set_to_none=True); loss.backward(); opt.step(); last_fused_loss = float(loss.detach())
     fused.eval()
 
     metrics = {
-        "examples": len(tensors),
-        "drafter_steps": int(drafter_steps),
-        "selector_steps": int(selector_steps),
-        "jump_steps": int(jump_steps),
-        "fused_steps": int(fused_steps),
-        "final_drafter_loss": last_draft_loss,
-        "final_selector_loss": last_selector_loss,
-        "final_jump_loss": last_jump_loss,
-        "final_fused_loss": last_fused_loss,
-        "aux_parameter_count": sum(
-            p.numel() for model in (drafter, selector, jump, fused) for p in model.parameters()
-        ),
+        "examples": len(tensors), "drafter_steps": int(drafter_steps), "selector_steps": int(selector_steps), "jump_steps": int(jump_steps), "fused_steps": int(fused_steps),
+        "final_drafter_loss": last_draft_loss, "final_selector_loss": last_selector_loss, "final_jump_loss": last_jump_loss, "final_fused_loss": last_fused_loss,
+        "aux_parameter_count": sum(p.numel() for model in (drafter, selector, jump, fused) for p in model.parameters()),
     }
     return drafter, selector, jump, fused, metrics
 
 
-def save_aux_bundle(
-    output_path: str | Path,
-    config: AuxConfig,
-    candidate_ids: list[int],
-    drafter: CompactParallelDrafter,
-    selector: PairwisePathSelector,
-    jump: CompactJumpHead,
-    fused: CompactFusedResidual,
-    metadata: dict,
-) -> None:
-    payload = {
-        "format_version": 1,
-        "config": asdict(config),
-        "candidate_ids": torch.tensor(candidate_ids, dtype=torch.long),
-        "drafter": drafter.state_dict(),
-        "selector": selector.state_dict(),
-        "jump": jump.state_dict(),
-        "fused": fused.state_dict(),
-        "metadata": metadata,
-    }
-    path = Path(output_path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(payload, path)
+def save_aux_bundle(output_path: str | Path, config: AuxConfig, candidate_ids: list[int], drafter: CompactParallelDrafter, selector: PairwisePathSelector, jump: CompactJumpHead, fused: CompactFusedResidual, metadata: dict) -> None:
+    payload = {"format_version": 2, "config": asdict(config), "candidate_ids": torch.tensor(candidate_ids, dtype=torch.long), "drafter": drafter.state_dict(), "selector": selector.state_dict(), "jump": jump.state_dict(), "fused": fused.state_dict(), "metadata": metadata}
+    path = Path(output_path); path.parent.mkdir(parents=True, exist_ok=True); torch.save(payload, path)
 
 
 def load_aux_bundle(path: str | Path):
-    payload = torch.load(path, map_location="cpu", weights_only=False)
-    config = AuxConfig(**payload["config"])
-    candidate_ids = payload["candidate_ids"].long()
+    payload = torch.load(path, map_location="cpu", weights_only=False); config = AuxConfig(**payload["config"]); candidate_ids = payload["candidate_ids"].long()
     drafter = CompactParallelDrafter(config); drafter.load_state_dict(payload["drafter"]); drafter.eval()
     selector = PairwisePathSelector(config); selector.load_state_dict(payload["selector"]); selector.eval()
     jump = CompactJumpHead(config); jump.load_state_dict(payload["jump"]); jump.eval()
