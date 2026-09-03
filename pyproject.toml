@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dflash-mini-lab"
-version = "1.0.0"
-description = "Reproducible CPU-only benchmark lab for normal, DFlash-style and DFlash v2-style decoding"
+version = "1.1.0"
+description = "Reproducible CPU benchmark lab for DFlash-style speculative decoding, including a real LFM2.5 target path"
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "MIT"}
@@ -17,9 +17,12 @@ dependencies = [
 
 [project.optional-dependencies]
 test = ["pytest==9.0.2"]
+real = ["transformers==5.16.1"]
 
 [project.scripts]
 dflash-mini-lab = "dflash_mini_lab.cli:main"
+dflash-lfm-prepare = "dflash_mini_lab.lfm_prepare:main"
+dflash-lfm-benchmark = "dflash_mini_lab.lfm_cli:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
