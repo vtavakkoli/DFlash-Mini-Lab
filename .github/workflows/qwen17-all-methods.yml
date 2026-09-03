@@ -67,11 +67,11 @@ jobs:
               --block-size 6 \
               --draft-dim 256 \
               --draft-layers 2 \
-              --drafter-steps 320 \
-              --selector-steps 160 \
-              --jump-steps 140 \
-              --fused-steps 140 \
-              --train-batch-size 8 \
+              --drafter-steps 1800 \
+              --selector-steps 900 \
+              --jump-steps 700 \
+              --fused-steps 700 \
+              --train-batch-size 16 \
               --cpu-threads 2
 
       - name: Run nine-way cached Qwen3-1.7B benchmark
@@ -98,7 +98,20 @@ jobs:
               --calibration-prompt-limit 2 \
               --top-k 8 \
               --cpu-threads 2 \
-              --dtype bfloat16
+              --dtype float32
+
+      - name: Upload Qwen3-1.7B diagnostic artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qwen3-17b-all-methods-benchmark
+          path: |
+            qwen17-reports/
+            qwen17-artifacts/manifest.json
+            qwen17-artifacts/distillation.json
+            qwen17-artifacts/qwen17_all_methods.pt
+          if-no-files-found: warn
+          retention-days: 30
 
       - name: Validate model, 10x training scale, exactness and method instrumentation
         run: |
@@ -114,12 +127,14 @@ jobs:
           assert d['model']['target_hidden_size']==2048
           assert d['model']['target_vocab_size']==151936
           assert d['model']['target_layer_ids']==[4,14,27]
-          assert d['model']['dtype']=='bfloat16'
+          assert d['model']['dtype']=='float32'
           m=d['training_metadata']
           assert m['distillation_seed_count']==32
           assert m['generation_tokens_per_seed']==100
           assert 3000 <= m['constructed_training_examples'] <= 3100
           assert m['training_scale_vs_qwen06'] >= 9.5
+          assert m['training']['drafter_steps'] >= 1800
+          assert m['training']['batch_size'] >= 16
           assert 512 < d['model']['candidate_size'] <= 8192
           assert d['mean_candidate_coverage'] > 0.50
           methods=('normal_cached','dflash','dflash2','dflash3_mobs','dflash4_jump_mobs','dflash5_fused_jump_mobs','dflash6_boltzmann','dflash6_bmobs','dflash7_act')
@@ -145,23 +160,13 @@ jobs:
           print('# Qwen3-1.7B-Base — all DFlash lab methods')
           print(f"Training examples: {d['training_metadata']['constructed_training_examples']} ({d['training_metadata']['training_scale_vs_qwen06']:.2f}x Qwen0.6 experiment)")
           print(f"Candidate coverage: {100*d['mean_candidate_coverage']:.1f}%")
+          print(f"Verifier dtype: {d['model']['dtype']} (lossless exactness gate)")
           print(f"Winner: **{d['winner']['method']}** — {d['winner']['tokens_per_second']:.3f} tok/s ({d['winner']['speedup_vs_normal']:.3f}x normal)")
           print('| Method | tok/s | vs normal | acceptance | target calls | target input tokens | exact |')
           print('|---|---:|---:|---:|---:|---:|:---:|')
           for method,s in d['summary'].items():
               print(f"| {method} | {s['tokens_per_second_median']:.3f} | {s['speedup_vs_normal']:.3f}x | {100*s['mean_acceptance_rate']:.1f}% | {s['mean_target_forward_passes']:.2f} | {s['mean_target_input_tokens']:.2f} | {'yes' if s['all_exact'] else 'no'} |")
           PY
-
-      - name: Upload Qwen3-1.7B all-method artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: qwen3-17b-all-methods-benchmark
-          path: |
-            qwen17-reports/
-            qwen17-artifacts/manifest.json
-            qwen17-artifacts/distillation.json
-            qwen17-artifacts/qwen17_all_methods.pt
-          retention-days: 30
 
       - name: Prepare combined benchmark Pages site
         if: github.event_name != 'pull_request'
