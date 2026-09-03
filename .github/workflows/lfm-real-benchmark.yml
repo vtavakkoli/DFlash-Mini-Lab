@@ -57,13 +57,14 @@ jobs:
             python -m dflash_mini_lab.lfm_prepare \
               --model-id LiquidAI/LFM2.5-350M-Base \
               --output-dir /app/lfm-artifacts \
-              --max-seed-count 8 \
-              --generation-tokens 12 \
-              --candidate-limit 1024 \
-              --drafter-steps 80 \
-              --selector-steps 50 \
-              --jump-steps 40 \
-              --fused-steps 50 \
+              --max-seed-count 24 \
+              --generation-tokens 20 \
+              --top-candidate-k 24 \
+              --candidate-limit 2048 \
+              --drafter-steps 180 \
+              --selector-steps 100 \
+              --jump-steps 80 \
+              --fused-steps 100 \
               --cpu-threads 2
 
       - name: Run eight-way real-model benchmark
@@ -85,9 +86,9 @@ jobs:
               --aux /app/lfm-artifacts/lfm_aux.pt \
               --prompts /app/real_benchmarks/prompts.json \
               --output-dir /app/lfm-reports \
-              --tokens 6 \
+              --tokens 8 \
               --repeats 1 \
-              --prompt-limit 4 \
+              --prompt-limit 6 \
               --top-k 8 \
               --jump-weight 0.5 \
               --fused-weight 1.0 \
@@ -109,7 +110,7 @@ jobs:
           assert d['model']['id'] == 'LiquidAI/LFM2.5-350M-Base'
           assert d['model']['target_parameter_count'] > 300_000_000
           assert d['model']['target_vocab_size'] == 65536
-          assert 1 < d['model']['candidate_size'] < d['model']['target_vocab_size']
+          assert 200 < d['model']['candidate_size'] <= 2048
           assert d['mean_candidate_coverage'] > 0
           expected=('normal','dflash','dflash2','dflash3_mobs','dflash4_jump_mobs','dflash5_fused_jump_mobs','dflash6_boltzmann','dflash6_bmobs')
           for method in expected:
