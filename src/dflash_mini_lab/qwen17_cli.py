@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+from pathlib import Path
 
 from .qwen17_benchmark import run_benchmark
 from .qwen17_runtime_safe import Qwen17Runtime
@@ -37,6 +38,20 @@ def main() -> None:
         calibration_prompt_limit=args.calibration_prompt_limit,
         top_k=args.top_k,
     )
+
+    # qwen17_benchmark historically labeled the target as bf16 because the
+    # distillation teacher is bf16. The measured verifier can intentionally use
+    # float32 for strict token-for-token exactness, so persist the runtime dtype
+    # supplied by the CLI rather than the training dtype.
+    payload["model"]["dtype"] = args.dtype
+    output_dir = Path(args.output_dir)
+    (output_dir / "benchmark.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    report_path = output_dir / "report.html"
+    if report_path.exists():
+        report = report_path.read_text(encoding="utf-8")
+        report = report.replace(" · bf16 CPU · decode-only timing.", f" · {args.dtype} CPU · decode-only timing.")
+        report_path.write_text(report, encoding="utf-8")
+
     print(json.dumps({
         "model": payload["model"],
         "training_scale": payload["training_metadata"].get("training_scale_vs_qwen06"),
