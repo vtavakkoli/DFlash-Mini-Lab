@@ -43,10 +43,10 @@ def _dtype(name: str) -> torch.dtype:
 def _one_generation(model: EaModel, input_ids: torch.Tensor, *, method: str, tokens: int, max_length: int) -> dict:
     if tokens < 1:
         raise ValueError("tokens must be positive")
-    # SafeAILab EAGLE stops when new_token > max_new_tokens, so tokens-1 asks
-    # naivegenerate for exactly `tokens` in the non-EOS case. EAGLE may finish
-    # a whole accepted tree path and overshoot; the requested prefix is what we
-    # compare, while wall time intentionally includes that overshoot overhead.
+    # SafeAILab EAGLE stops when new_token > max_new_tokens. Asking for
+    # tokens-1 yields exactly `tokens` on the normal path. EAGLE may accept a
+    # whole tree path and overshoot; the requested prefix is compared while
+    # timing deliberately retains that overshoot cost.
     internal_max_new = max(0, int(tokens) - 1)
     input_len = int(input_ids.shape[1])
     fn = model.naivegenerate if method == "normal_eagle_runtime" else model.eagenerate
@@ -81,8 +81,16 @@ def _one_generation(model: EaModel, input_ids: torch.Tensor, *, method: str, tok
     }
 
 
+def _first_mismatch(normal: list[int], eagle: list[int]) -> int | None:
+    for i, (a, b) in enumerate(zip(normal, eagle)):
+        if a != b:
+            return i
+    if len(normal) != len(eagle):
+        return min(len(normal), len(eagle))
+    return None
+
+
 def _write_html(payload: dict, path: Path) -> None:
-    n = payload["summary"]["normal_eagle_runtime"]
     e = payload["summary"]["eagle3"]
     verdict = (
         "EAGLE-3 is faster than its matched normal baseline on this runner."
@@ -102,16 +110,19 @@ def _write_html(payload: dict, path: Path) -> None:
             f"<td>{'✓' if s['all_exact'] else '✗'}</td>"
             "</tr>"
         )
+    mismatch_text = "None — all requested greedy prefixes are exact."
+    if payload["mismatches"]:
+        mismatch_text = html.escape(json.dumps(payload["mismatches"], indent=2))
 
     path.write_text(
         f"""<!doctype html><html><head><meta charset='utf-8'><title>DFlash Mini Lab · Version 8 EAGLE-3</title>
-<style>body{{font-family:system-ui,-apple-system,sans-serif;max-width:1050px;margin:40px auto;padding:0 20px;color:#171717}}.hero,.note{{padding:18px 22px;border-radius:14px;background:#f5f6f8;margin:18px 0}}.note{{background:#fff7df}}table{{border-collapse:collapse;width:100%;margin:22px 0}}th,td{{padding:10px;border-bottom:1px solid #ddd;text-align:right}}th:first-child,td:first-child{{text-align:left}}code{{background:#eee;padding:2px 5px;border-radius:4px}}</style></head><body>
+<style>body{{font-family:system-ui,-apple-system,sans-serif;max-width:1050px;margin:40px auto;padding:0 20px;color:#171717}}.hero,.note{{padding:18px 22px;border-radius:14px;background:#f5f6f8;margin:18px 0}}.note{{background:#fff7df}}table{{border-collapse:collapse;width:100%;margin:22px 0}}th,td{{padding:10px;border-bottom:1px solid #ddd;text-align:right}}th:first-child,td:first-child{{text-align:left}}code,pre{{background:#eee;padding:2px 5px;border-radius:4px}}pre{{padding:12px;overflow:auto}}</style></head><body>
 <h1>Version 8 — EAGLE-3 baseline</h1>
 <div class='hero'><p><b>{html.escape(verdict)}</b></p><p>Matched target: <code>{html.escape(payload['model']['base_model'])}</code> · draft: <code>{html.escape(payload['model']['eagle_model'])}</code>.</p><p>Measured EAGLE speedup: <b>{e['speedup_vs_normal']:.3f}×</b>. Timing includes prefill, EAGLE draft-tree work, target verification, cache maintenance and Python overhead.</p></div>
 <table><thead><tr><th>Method</th><th>tok/s</th><th>vs normal</th><th>median wall ms</th><th>tokens / iteration</th><th>exact</th></tr></thead><tbody>{''.join(rows)}</tbody></table>
 <h2>Configuration</h2><ul><li>dtype: <code>{html.escape(payload['config']['dtype'])}</code></li><li>CPU threads: {payload['config']['cpu_threads']}</li><li>requested tokens: {payload['config']['tokens']}</li><li>prompts: {payload['config']['prompt_count']}</li><li>EAGLE tree budget: {payload['config']['total_token']}</li><li>depth: {payload['config']['depth']}</li><li>draft top-k: {payload['config']['draft_top_k']}</li></ul>
 <div class='note'><b>Comparison scope.</b> The public AngelSlim checkpoint is paired with <code>Qwen/Qwen3-1.7B</code>, not <code>Qwen/Qwen3-1.7B-Base</code>. Therefore the EAGLE <i>speedup ratio</i> can be compared with the earlier DFlash study, but raw tok/s should not be presented as an apples-to-apples model comparison.</div>
-<h2>Exactness</h2><p>For every held-out prompt, the first requested greedy tokens from EAGLE-3 must equal the same target model's <code>naivegenerate</code> output token-for-token. CI fails if this invariant is violated.</p>
+<h2>Exactness</h2><p>For every held-out prompt, the first requested greedy tokens from EAGLE-3 must equal the same target model's <code>naivegenerate</code> output token-for-token. The measured runtime uses float32 because bf16 tree-vs-sequential evaluation produced numerical argmax divergence on the CPU runner.</p><pre>{mismatch_text}</pre>
 <h2>Reproducibility</h2><p>SafeAILab/EAGLE source is pinned to <code>{UPSTREAM_EAGLE_COMMIT}</code>. Model weights are downloaded at runtime and are not redistributed by DFlash Mini Lab.</p>
 </body></html>""",
         encoding="utf-8",
@@ -140,17 +151,17 @@ def run(args: argparse.Namespace) -> dict:
     model.eval()
 
     # Allocate both cache paths before measurement so neither method pays one-off
-    # tensor/cache construction in the reported timings.
+    # cache allocation in reported timings.
     warm = torch.as_tensor(model.tokenizer([prompts[0]], add_special_tokens=True).input_ids, dtype=torch.long)
     _one_generation(model, warm, method="normal_eagle_runtime", tokens=2, max_length=args.max_length)
     _one_generation(model, warm, method="eagle3", tokens=2, max_length=args.max_length)
 
     records: list[dict] = []
     exact_rows: list[bool] = []
+    mismatches: list[dict] = []
     for repeat in range(max(1, int(args.repeats))):
         for prompt_index, prompt in enumerate(prompts):
             ids = torch.as_tensor(model.tokenizer([prompt], add_special_tokens=True).input_ids, dtype=torch.long)
-            # Alternate measured order to reduce systematic first/second-method bias.
             order = ("normal_eagle_runtime", "eagle3") if (prompt_index + repeat) % 2 == 0 else ("eagle3", "normal_eagle_runtime")
             by_method = {}
             for method in order:
@@ -161,6 +172,17 @@ def run(args: argparse.Namespace) -> dict:
             eagle_tokens = by_method["eagle3"]["tokens"]
             exact = normal_tokens == eagle_tokens and len(normal_tokens) > 0
             exact_rows.append(bool(exact))
+            if not exact:
+                pos = _first_mismatch(normal_tokens, eagle_tokens)
+                mismatches.append({
+                    "prompt_index": int(prompt_index),
+                    "repeat": int(repeat),
+                    "first_mismatch_position": pos,
+                    "normal_token": normal_tokens[pos] if pos is not None and pos < len(normal_tokens) else None,
+                    "eagle_token": eagle_tokens[pos] if pos is not None and pos < len(eagle_tokens) else None,
+                    "normal_tokens": normal_tokens,
+                    "eagle_tokens": eagle_tokens,
+                })
             for method in ("normal_eagle_runtime", "eagle3"):
                 row = by_method[method]
                 row["exact"] = True if method == "normal_eagle_runtime" else bool(exact)
@@ -214,6 +236,7 @@ def run(args: argparse.Namespace) -> dict:
         },
         "summary": summary,
         "all_exact": bool(all(exact_rows)),
+        "mismatches": mismatches,
         "records": records,
         "comparison_note": "EAGLE uses its matched Qwen/Qwen3-1.7B checkpoint; earlier DFlash 1.7B experiments use Qwen/Qwen3-1.7B-Base. Compare relative speedup, not raw tok/s.",
     }
@@ -234,7 +257,7 @@ def main() -> None:
     parser.add_argument("--prompt-limit", type=int, default=6)
     parser.add_argument("--tokens", type=int, default=16)
     parser.add_argument("--repeats", type=int, default=1)
-    parser.add_argument("--dtype", choices=("bfloat16", "float32"), default="bfloat16")
+    parser.add_argument("--dtype", choices=("bfloat16", "float32"), default="float32")
     parser.add_argument("--cpu-threads", type=int, default=int(os.getenv("CPU_THREADS", "2")))
     parser.add_argument("--total-token", type=int, default=60)
     parser.add_argument("--depth", type=int, default=7)
@@ -243,7 +266,7 @@ def main() -> None:
     parser.add_argument("--max-length", type=int, default=256)
     args = parser.parse_args()
     payload = run(args)
-    print(json.dumps({"model": payload["model"], "config": payload["config"], "summary": payload["summary"], "all_exact": payload["all_exact"]}, indent=2))
+    print(json.dumps({"model": payload["model"], "config": payload["config"], "summary": payload["summary"], "all_exact": payload["all_exact"], "mismatches": payload["mismatches"]}, indent=2))
 
 
 if __name__ == "__main__":
