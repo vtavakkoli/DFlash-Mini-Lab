@@ -60,13 +60,21 @@ jobs:
               --prompt-limit 6 \
               --tokens 16 \
               --repeats 1 \
-              --dtype bfloat16 \
+              --dtype float32 \
               --cpu-threads 2 \
               --total-token 60 \
               --depth 7 \
               --draft-top-k 10 \
               --threshold 1.0 \
               --max-length 256
+
+      - name: Upload Version 8 diagnostic artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: eagle3-v8-qwen3-17b-benchmark
+          path: eagle3-reports/
+          retention-days: 30
 
       - name: Validate V8 exactness, matched checkpoint and overhead accounting
         run: |
@@ -81,11 +89,13 @@ jobs:
           assert 1_500_000_000 < d['model']['target_parameter_count'] < 2_000_000_000
           assert d['model']['draft_parameter_count'] > 10_000_000
           assert d['upstream']['commit']=='cb7e0841fe0c206c6ed74a197ad5e2a1f13f5a2b'
+          assert d['config']['dtype']=='float32'
           assert d['config']['total_token']==60
           assert d['config']['depth']==7
           assert d['config']['draft_top_k']==10
           assert 'includes prefill' in d['config']['timing_scope']
-          assert d['all_exact']
+          assert d['all_exact'], d['mismatches']
+          assert not d['mismatches']
           n=d['summary']['normal_eagle_runtime']; e=d['summary']['eagle3']
           assert n['all_exact'] and e['all_exact']
           assert n['median_tokens_per_second'] > 0
@@ -104,16 +114,10 @@ jobs:
           print(f"Normal: **{n['median_tokens_per_second']:.3f} tok/s**")
           print(f"EAGLE-3: **{e['median_tokens_per_second']:.3f} tok/s** ({e['speedup_vs_normal']:.3f}x normal)")
           print(f"Exact: **{d['all_exact']}**")
+          print('Measured dtype: float32; bf16 was retained only as a diagnostic because batched tree evaluation changed at least one greedy argmax on CPU.')
           print('Timing includes prefill, drafting, verification, cache work and Python overhead.')
           print('The matched public EAGLE checkpoint targets Qwen/Qwen3-1.7B, not Qwen3-1.7B-Base; compare speedup ratios with the earlier DFlash Base study, not raw tok/s.')
           PY
-
-      - name: Upload Version 8 benchmark artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: eagle3-v8-qwen3-17b-benchmark
-          path: eagle3-reports/
-          retention-days: 30
 
       - name: Prepare combined benchmark Pages site
         if: github.event_name != 'pull_request'
@@ -146,7 +150,7 @@ jobs:
           python - <<'PY'
           import html,json,os
           e=json.load(open('eagle3-reports/benchmark.json'))
-          es=e['summary']['eagle3']; ns=e['summary']['normal_eagle_runtime']
+          es=e['summary']['eagle3']
           q17=None
           p='/tmp/q17/qwen17-reports/benchmark.json'
           if os.path.exists(p): q17=json.load(open(p))
