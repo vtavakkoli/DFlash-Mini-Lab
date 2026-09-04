@@ -1,0 +1,184 @@
+name: Version 8 EAGLE3 baseline
+
+on:
+  pull_request:
+    paths:
+      - "Dockerfile.eagle3"
+      - "src/dflash_mini_lab/eagle3_v8.py"
+      - ".github/workflows/eagle3-v8.yml"
+      - "qwen_benchmarks/prompts.json"
+      - "README.md"
+  push:
+    branches: [main]
+    paths:
+      - "Dockerfile.eagle3"
+      - "src/dflash_mini_lab/eagle3_v8.py"
+      - ".github/workflows/eagle3-v8.yml"
+      - "qwen_benchmarks/prompts.json"
+      - "README.md"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: "eagle3-v8-${{ github.ref }}"
+  cancel-in-progress: true
+
+jobs:
+  eagle3-cpu:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Restore Qwen3-1.7B + EAGLE3 Hugging Face cache
+        uses: actions/cache@v4
+        with:
+          path: hf-eagle3-cache
+          key: eagle3-qwen3-17b-${{ runner.os }}-torch26-tf4533-v1
+
+      - name: Build pinned EAGLE3 image
+        run: docker build -f Dockerfile.eagle3 -t dflash-eagle3-v8 .
+
+      - name: Run matched end-to-end EAGLE3 benchmark
+        run: |
+          mkdir -p hf-eagle3-cache eagle3-reports
+          docker run --rm \
+            -e HF_HOME=/cache \
+            -e CPU_THREADS=2 -e OMP_NUM_THREADS=2 -e MKL_NUM_THREADS=2 -e OPENBLAS_NUM_THREADS=2 \
+            -v "$PWD/hf-eagle3-cache:/cache" \
+            -v "$PWD/eagle3-reports:/app/eagle3-reports" \
+            dflash-eagle3-v8 \
+              --base-model Qwen/Qwen3-1.7B \
+              --eagle-model AngelSlim/Qwen3-1.7B_eagle3 \
+              --prompts /app/qwen_benchmarks/prompts.json \
+              --output-dir /app/eagle3-reports \
+              --prompt-limit 6 \
+              --tokens 16 \
+              --repeats 1 \
+              --dtype bfloat16 \
+              --cpu-threads 2 \
+              --total-token 60 \
+              --depth 7 \
+              --draft-top-k 10 \
+              --threshold 1.0 \
+              --max-length 256
+
+      - name: Validate V8 exactness, matched checkpoint and overhead accounting
+        run: |
+          test -s eagle3-reports/benchmark.json
+          test -s eagle3-reports/report.html
+          python - <<'PY'
+          import json
+          d=json.load(open('eagle3-reports/benchmark.json'))
+          assert d['version']=='8'
+          assert d['model']['base_model']=='Qwen/Qwen3-1.7B'
+          assert d['model']['eagle_model']=='AngelSlim/Qwen3-1.7B_eagle3'
+          assert 1_500_000_000 < d['model']['target_parameter_count'] < 2_000_000_000
+          assert d['model']['draft_parameter_count'] > 10_000_000
+          assert d['upstream']['commit']=='cb7e0841fe0c206c6ed74a197ad5e2a1f13f5a2b'
+          assert d['config']['total_token']==60
+          assert d['config']['depth']==7
+          assert d['config']['draft_top_k']==10
+          assert 'includes prefill' in d['config']['timing_scope']
+          assert d['all_exact']
+          n=d['summary']['normal_eagle_runtime']; e=d['summary']['eagle3']
+          assert n['all_exact'] and e['all_exact']
+          assert n['median_tokens_per_second'] > 0
+          assert e['median_tokens_per_second'] > 0
+          assert e['speedup_vs_normal'] > 0
+          print(json.dumps({'normal':n,'eagle3':e,'model':d['model']},indent=2))
+          PY
+
+      - name: Write Version 8 summary
+        run: |
+          python - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json
+          d=json.load(open('eagle3-reports/benchmark.json'))
+          n=d['summary']['normal_eagle_runtime']; e=d['summary']['eagle3']
+          print('# Version 8 — EAGLE-3 / Qwen3-1.7B')
+          print(f"Normal: **{n['median_tokens_per_second']:.3f} tok/s**")
+          print(f"EAGLE-3: **{e['median_tokens_per_second']:.3f} tok/s** ({e['speedup_vs_normal']:.3f}x normal)")
+          print(f"Exact: **{d['all_exact']}**")
+          print('Timing includes prefill, drafting, verification, cache work and Python overhead.')
+          print('The matched public EAGLE checkpoint targets Qwen/Qwen3-1.7B, not Qwen3-1.7B-Base; compare speedup ratios with the earlier DFlash Base study, not raw tok/s.')
+          PY
+
+      - name: Upload Version 8 benchmark artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: eagle3-v8-qwen3-17b-benchmark
+          path: eagle3-reports/
+          retention-days: 30
+
+      - name: Prepare combined benchmark Pages site
+        if: github.event_name != 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          rm -rf pages /tmp/q17 /tmp/q06 /tmp/tiny
+          mkdir -p pages/eagle3
+          cp eagle3-reports/report.html pages/eagle3/index.html
+          cp eagle3-reports/report.html pages/eagle3/report.html
+          cp eagle3-reports/benchmark.json pages/eagle3/benchmark.json
+
+          fetch_artifact () {
+            name="$1"; dest="$2"; zip="$3"
+            id=$(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts?name=$name&per_page=20" --jq '.artifacts | map(select(.expired==false)) | .[0].id // empty')
+            if [ -n "$id" ]; then
+              mkdir -p "$dest"
+              gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$id/zip" > "$zip"
+              unzip -q "$zip" -d "$dest"
+            fi
+          }
+          fetch_artifact qwen3-17b-all-methods-benchmark /tmp/q17 /tmp/q17.zip || true
+          fetch_artifact qwen3-06b-dflash7-benchmark /tmp/q06 /tmp/q06.zip || true
+          fetch_artifact dflash-cpu-report /tmp/tiny /tmp/tiny.zip || true
+
+          if [ -s /tmp/q17/qwen17-reports/report.html ]; then mkdir -p pages/qwen17; cp -r /tmp/q17/qwen17-reports/* pages/qwen17/; fi
+          if [ -s /tmp/q06/qwen-reports/report.html ]; then mkdir -p pages/qwen06; cp -r /tmp/q06/qwen-reports/* pages/qwen06/; fi
+          if [ -s /tmp/tiny/report.html ]; then mkdir -p pages/tiny; cp -r /tmp/tiny/* pages/tiny/; fi
+
+          python - <<'PY'
+          import html,json,os
+          e=json.load(open('eagle3-reports/benchmark.json'))
+          es=e['summary']['eagle3']; ns=e['summary']['normal_eagle_runtime']
+          q17=None
+          p='/tmp/q17/qwen17-reports/benchmark.json'
+          if os.path.exists(p): q17=json.load(open(p))
+          qtext=''
+          if q17:
+              best=max((m for m in q17['summary'] if m!='normal_cached'),key=lambda m:q17['summary'][m]['speedup_vs_normal'])
+              bs=q17['summary'][best]
+              qtext=f"<p>Earlier Qwen3-1.7B-Base best speculative ratio: <b>{html.escape(best)}</b> at {bs['speedup_vs_normal']:.3f}× normal. <a href='qwen17/'>Open nine-way DFlash report →</a></p>"
+          verdict='speedup' if es['speedup_vs_normal']>1 else 'no CPU speedup'
+          open('pages/index.html','w').write(f'''<!doctype html><html><head><meta charset="utf-8"><title>DFlash Mini Lab benchmarks</title><style>body{{font-family:system-ui;max-width:950px;margin:50px auto;padding:0 20px}}.card{{padding:20px;border:1px solid #ddd;border-radius:14px;margin:16px 0}}</style></head><body><h1>DFlash Mini Lab — verified benchmarks</h1><div class="card"><h2>Version 8 · EAGLE-3</h2><p>Matched Qwen3-1.7B EAGLE-3: <b>{es['median_tokens_per_second']:.3f} tok/s</b>, {es['speedup_vs_normal']:.3f}× its normal baseline ({verdict}). All requested tokens exact: <b>{e['all_exact']}</b>.</p><p><a href="eagle3/">Open Version 8 EAGLE-3 report →</a></p></div><div class="card"><h2>DFlash studies</h2>{qtext}<p><a href="qwen06/">Qwen3-0.6B DFlash7</a> · <a href="tiny/">Tiny CPU study</a></p></div><p>Raw tok/s across Qwen3-1.7B and Qwen3-1.7B-Base are not directly comparable; use each method's speedup ratio against its matched normal target.</p></body></html>''')
+          PY
+          touch pages/.nojekyll
+
+      - name: Upload GitHub Pages artifact
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: pages
+
+  deploy-pages:
+    if: github.event_name != 'pull_request'
+    needs: eagle3-cpu
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      pages: write
+      id-token: write
+      actions: read
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy combined benchmark site
+        id: deployment
+        uses: actions/deploy-pages@v4
