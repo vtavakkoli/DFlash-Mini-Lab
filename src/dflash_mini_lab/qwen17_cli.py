@@ -10,6 +10,10 @@ from .qwen17_runtime_safe import Qwen17Runtime
 
 
 def main() -> None:
+    # Keep this real-model DFlash CLI in the Version 8 change set as an explicit
+    # cross-regression gate: EAGLE-3 uses a separate dependency/runtime image,
+    # while the earlier Qwen3-1.7B-Base DFlash study must remain independently
+    # reproducible and exact after the new baseline is added.
     parser = argparse.ArgumentParser(description="Benchmark all DFlash Mini Lab methods on Qwen3-1.7B-Base")
     parser.add_argument("--aux", default="qwen17-artifacts/qwen17_all_methods.pt")
     parser.add_argument("--model-id", default="Qwen/Qwen3-1.7B-Base")
