@@ -1,4 +1,4 @@
-name: LFM2.5 real benchmark
+name: LFM2.5 all-method CPU showcase
 
 on:
   pull_request:
@@ -21,6 +21,8 @@ on:
 permissions:
   contents: read
   actions: read
+  pages: write
+  id-token: write
 
 concurrency:
   group: "lfm-real-${{ github.ref }}"
@@ -29,7 +31,7 @@ concurrency:
 jobs:
   lfm-real-cpu:
     runs-on: ubuntu-latest
-    timeout-minutes: 55
+    timeout-minutes: 80
     steps:
       - uses: actions/checkout@v6
 
@@ -40,7 +42,11 @@ jobs:
           key: lfm25-350m-base-${{ runner.os }}-transformers5161-v1
 
       - name: Build LFM CPU benchmark image
-        run: docker build -f Dockerfile.lfm -t dflash-lfm-real .
+        run: |
+          docker build -f Dockerfile.lfm -t dflash-lfm-real .
+          docker run --rm dflash-lfm-real python -m py_compile \
+            /app/src/dflash_mini_lab/lfm_benchmark.py \
+            /app/src/dflash_mini_lab/lfm_showcase.py
 
       - name: Prepare LFM-generated distillation corpus and auxiliaries
         run: |
@@ -67,7 +73,7 @@ jobs:
               --fused-steps 180 \
               --cpu-threads 2
 
-      - name: Run eight-way real-model benchmark
+      - name: Run Normal plus DFlash1-7 showcase benchmark
         run: |
           mkdir -p lfm-reports
           docker run --rm \
@@ -82,13 +88,16 @@ jobs:
             -v "$PWD/lfm-artifacts:/app/lfm-artifacts:ro" \
             -v "$PWD/lfm-reports:/app/lfm-reports" \
             dflash-lfm-real \
-            python -m dflash_mini_lab.lfm_cli \
+            python -m dflash_mini_lab.lfm_showcase \
               --aux /app/lfm-artifacts/lfm_aux.pt \
               --prompts /app/real_benchmarks/prompts.json \
+              --calibration-prompts /app/real_benchmarks/calibration_prompts.json \
               --output-dir /app/lfm-reports \
-              --tokens 8 \
-              --repeats 1 \
+              --tokens 16 \
+              --repeats 2 \
               --prompt-limit 6 \
+              --calibration-tokens 8 \
+              --calibration-prompt-limit 4 \
               --top-k 8 \
               --jump-weight 0.5 \
               --fused-weight 1.0 \
@@ -97,13 +106,25 @@ jobs:
               --cpu-threads 2 \
               --dtype float32
 
-      - name: Validate real target and exactness
+      - name: Upload showcase diagnostics
+        uses: actions/upload-artifact@v4
+        with:
+          name: lfm25-350m-all-method-showcase
+          path: |
+            lfm-reports/
+            lfm-artifacts/manifest.json
+            lfm-artifacts/distillation.json
+            lfm-artifacts/lfm_aux.pt
+          retention-days: 30
+
+      - name: Validate real target, all methods, demos and exactness
         run: |
           test -s lfm-artifacts/lfm_aux.pt
-          test -s lfm-artifacts/manifest.json
-          test -s lfm-artifacts/distillation.json
           test -s lfm-reports/benchmark.json
           test -s lfm-reports/report.html
+          grep -q "Live demo 1" lfm-reports/report.html
+          grep -q "Live demo 2" lfm-reports/report.html
+          grep -q "Animated architecture" lfm-reports/report.html
           python - <<'PY'
           import json
           d=json.load(open('lfm-reports/benchmark.json'))
@@ -112,14 +133,22 @@ jobs:
           assert d['model']['target_vocab_size'] == 65536
           assert 200 < d['model']['candidate_size'] <= 2048
           assert d['mean_candidate_coverage'] > 0
-          expected=('normal','dflash','dflash2','dflash3_mobs','dflash4_jump_mobs','dflash5_fused_jump_mobs','dflash6_boltzmann','dflash6_bmobs')
+          assert d['config']['max_new_tokens'] == 16
+          assert d['config']['repeats'] == 2
+          assert d['config']['prompt_count'] == 6
+          assert d['showcase']['live_demo_count'] == 2
+          expected=('normal','dflash','dflash2','dflash3_mobs','dflash4_jump_mobs','dflash5_fused_jump_mobs','dflash6_boltzmann','dflash6_bmobs','dflash7_act')
           for method in expected:
               assert d['summary'][method]['all_exact'], method
               assert d['summary'][method]['tokens_per_second_median'] > 0, method
+              assert d['summary'][method]['speedup_vs_normal'] > 0, method
           assert d['summary']['normal']['mean_target_forward_passes'] == d['config']['max_new_tokens']
           assert d['summary']['dflash6_boltzmann']['mean_total_guidance_scores'] > 0
           assert d['summary']['dflash6_bmobs']['mean_total_guidance_scores'] > 0
-          print(json.dumps(d['summary'], indent=2))
+          assert d['dflash7_calibration']['held_out_from_benchmark'] is True
+          assert all(x['all_exact'] for x in d['dflash7_calibration']['candidates'])
+          assert d['winner'] in expected
+          print(json.dumps({'winner':d['winner'],'summary':d['summary'],'act':d['dflash7_calibration']}, indent=2))
           PY
 
       - name: Write benchmark summary
@@ -127,22 +156,77 @@ jobs:
           python - <<'PY' >> "$GITHUB_STEP_SUMMARY"
           import json
           d=json.load(open('lfm-reports/benchmark.json'))
-          print('# LFM2.5-350M-Base real benchmark')
+          print('# LFM2.5-350M-Base · Normal + DFlash1–7')
+          print(f"Winner: **{d['winner']}**")
           print(f"Candidate vocabulary: {d['model']['candidate_size']} / {d['model']['target_vocab_size']}")
           print(f"Mean candidate coverage: {100*d['mean_candidate_coverage']:.1f}%")
-          print('| Method | tok/s | speedup | acceptance | tokens/target pass |')
-          print('|---|---:|---:|---:|---:|')
+          print(f"DFlash7 ACT threshold: {d['dflash7_calibration']['selected_threshold']}")
+          print('| Method | tok/s | speedup | acceptance | tokens/target pass | exact |')
+          print('|---|---:|---:|---:|---:|:---:|')
           for name,s in d['summary'].items():
-              print(f"| {name} | {s['tokens_per_second_median']:.3f} | {s['speedup_vs_normal']:.3f}x | {100*s['mean_acceptance_rate']:.1f}% | {s['mean_tokens_per_target_pass']:.2f} |")
+              print(f"| {name} | {s['tokens_per_second_median']:.3f} | {s['speedup_vs_normal']:.3f}x | {100*s['mean_acceptance_rate']:.1f}% | {s['mean_tokens_per_target_pass']:.2f} | {'yes' if s['all_exact'] else 'NO'} |")
+          print('The HTML artifact contains an animated architecture plus two interactive data-driven demos.')
           PY
 
-      - name: Upload real benchmark artifact
-        uses: actions/upload-artifact@v4
+      - name: Prepare combined GitHub Pages site
+        if: github.event_name != 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          rm -rf pages /tmp/eagle /tmp/q17 /tmp/q06 /tmp/tiny
+          mkdir -p pages/lfm
+          cp lfm-reports/report.html pages/index.html
+          cp lfm-reports/report.html pages/lfm/index.html
+          cp lfm-reports/benchmark.json pages/lfm/benchmark.json
+
+          fetch_artifact () {
+            name="$1"; dest="$2"; zip="$3"
+            id=$(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts?name=$name&per_page=20" --jq '.artifacts | map(select(.expired==false)) | .[0].id // empty')
+            if [ -n "$id" ]; then
+              mkdir -p "$dest"
+              gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$id/zip" > "$zip"
+              unzip -q "$zip" -d "$dest"
+            fi
+          }
+          fetch_artifact eagle3-v8-qwen3-17b-benchmark /tmp/eagle /tmp/eagle.zip || true
+          fetch_artifact qwen3-17b-all-methods-benchmark /tmp/q17 /tmp/q17.zip || true
+          fetch_artifact qwen3-06b-dflash7-benchmark /tmp/q06 /tmp/q06.zip || true
+          fetch_artifact dflash-cpu-report /tmp/tiny /tmp/tiny.zip || true
+
+          if [ -s /tmp/eagle/report.html ]; then mkdir -p pages/eagle3; cp /tmp/eagle/report.html pages/eagle3/index.html; cp /tmp/eagle/benchmark.json pages/eagle3/benchmark.json; fi
+          if [ -s /tmp/q17/qwen17-reports/report.html ]; then mkdir -p pages/qwen17; cp -r /tmp/q17/qwen17-reports/* pages/qwen17/; fi
+          if [ -s /tmp/q06/qwen-reports/report.html ]; then mkdir -p pages/qwen06; cp -r /tmp/q06/qwen-reports/* pages/qwen06/; fi
+          if [ -s /tmp/tiny/report.html ]; then mkdir -p pages/tiny; cp -r /tmp/tiny/* pages/tiny/; fi
+
+          python - <<'PY'
+          from pathlib import Path
+          p=Path('pages/index.html')
+          s=p.read_text()
+          nav="""<div style='position:sticky;top:8px;z-index:30;max-width:1240px;margin:8px auto;padding:8px 16px;border:1px solid #294963;border-radius:14px;background:#07111fee;backdrop-filter:blur(12px);font-family:system-ui'><b>LFM showcase</b> · <a style='color:#58d9ff' href='./lfm/'>LFM</a> · <a style='color:#58d9ff' href='./qwen17/'>Qwen1.7B</a> · <a style='color:#58d9ff' href='./eagle3/'>EAGLE3</a> · <a style='color:#58d9ff' href='./qwen06/'>Qwen0.6B</a> · <a style='color:#58d9ff' href='./tiny/'>Tiny</a></div>"""
+          s=s.replace('<body>', '<body>'+nav, 1)
+          p.write_text(s)
+          Path('pages/.nojekyll').touch()
+          PY
+
+      - name: Upload GitHub Pages artifact
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-pages-artifact@v4
         with:
-          name: lfm25-350m-real-benchmark
-          path: |
-            lfm-reports/
-            lfm-artifacts/manifest.json
-            lfm-artifacts/distillation.json
-            lfm-artifacts/lfm_aux.pt
-          retention-days: 30
+          path: pages
+
+  deploy-pages:
+    if: github.event_name != 'pull_request'
+    needs: lfm-real-cpu
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      pages: write
+      id-token: write
+      actions: read
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy combined benchmark site
+        id: deployment
+        uses: actions/deploy-pages@v4
