@@ -1,4 +1,4 @@
-name: LFM2.5 all-method CPU showcase
+name: LFM2.5 V9 DSpark + V10 Boltzmann CPU study
 
 on:
   pull_request:
@@ -31,7 +31,7 @@ concurrency:
 jobs:
   lfm-real-cpu:
     runs-on: ubuntu-latest
-    timeout-minutes: 80
+    timeout-minutes: 110
     steps:
       - uses: actions/checkout@v6
 
@@ -46,9 +46,12 @@ jobs:
           docker build -f Dockerfile.lfm -t dflash-lfm-real .
           docker run --rm dflash-lfm-real python -m py_compile \
             /app/src/dflash_mini_lab/lfm_benchmark.py \
-            /app/src/dflash_mini_lab/lfm_showcase.py
+            /app/src/dflash_mini_lab/lfm_showcase.py \
+            /app/src/dflash_mini_lab/lfm_dspark.py \
+            /app/src/dflash_mini_lab/lfm_v10.py \
+            /app/src/dflash_mini_lab/lfm_v9v10_benchmark.py
 
-      - name: Prepare LFM-generated distillation corpus and auxiliaries
+      - name: Prepare frozen DFlash backbone and legacy auxiliaries
         run: |
           mkdir -p hf-cache lfm-artifacts
           docker run --rm \
@@ -73,7 +76,32 @@ jobs:
               --fused-steps 180 \
               --cpu-threads 2
 
-      - name: Run Normal plus DFlash1-7 showcase benchmark
+      - name: Train V9 DSpark-Lite Markov and confidence heads
+        run: |
+          docker run --rm \
+            -e HF_HOME=/cache \
+            -e TRANSFORMERS_OFFLINE=1 \
+            -e HF_HUB_OFFLINE=1 \
+            -e CPU_THREADS=2 \
+            -e OMP_NUM_THREADS=2 \
+            -e MKL_NUM_THREADS=2 \
+            -e OPENBLAS_NUM_THREADS=2 \
+            -v "$PWD/hf-cache:/cache" \
+            -v "$PWD/lfm-artifacts:/app/lfm-artifacts" \
+            dflash-lfm-real \
+            python -m dflash_mini_lab.lfm_dspark \
+              --aux /app/lfm-artifacts/lfm_aux.pt \
+              --output /app/lfm-artifacts/lfm_dspark.pt \
+              --seeds /app/real_benchmarks/train_seeds.json \
+              --max-seed-count 40 \
+              --generation-tokens 32 \
+              --markov-rank 16 \
+              --markov-steps 180 \
+              --confidence-steps 100 \
+              --batch-size 64 \
+              --cpu-threads 2
+
+      - name: Run 11-way LFM CPU benchmark with V9 and V10
         run: |
           mkdir -p lfm-reports
           docker run --rm \
@@ -88,13 +116,14 @@ jobs:
             -v "$PWD/lfm-artifacts:/app/lfm-artifacts:ro" \
             -v "$PWD/lfm-reports:/app/lfm-reports" \
             dflash-lfm-real \
-            python -m dflash_mini_lab.lfm_showcase \
+            python -m dflash_mini_lab.lfm_v9v10_benchmark \
               --aux /app/lfm-artifacts/lfm_aux.pt \
+              --dspark /app/lfm-artifacts/lfm_dspark.pt \
               --prompts /app/real_benchmarks/prompts.json \
               --calibration-prompts /app/real_benchmarks/calibration_prompts.json \
               --output-dir /app/lfm-reports \
-              --tokens 16 \
-              --repeats 2 \
+              --tokens 24 \
+              --repeats 3 \
               --prompt-limit 6 \
               --calibration-tokens 8 \
               --calibration-prompt-limit 4 \
@@ -106,25 +135,29 @@ jobs:
               --cpu-threads 2 \
               --dtype float32
 
-      - name: Upload showcase diagnostics
+      - name: Upload V9/V10 diagnostic artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: lfm25-350m-all-method-showcase
+          name: lfm25-350m-v9-v10-showcase
           path: |
             lfm-reports/
             lfm-artifacts/manifest.json
             lfm-artifacts/distillation.json
             lfm-artifacts/lfm_aux.pt
+            lfm-artifacts/lfm_dspark.pt
           retention-days: 30
 
-      - name: Validate real target, all methods, demos and exactness
+      - name: Validate exactness, DSpark heads and V10 low-operation path
         run: |
           test -s lfm-artifacts/lfm_aux.pt
+          test -s lfm-artifacts/lfm_dspark.pt
           test -s lfm-reports/benchmark.json
           test -s lfm-reports/report.html
           grep -q "Live demo 1" lfm-reports/report.html
           grep -q "Live demo 2" lfm-reports/report.html
           grep -q "Animated architecture" lfm-reports/report.html
+          grep -q "V9 DSpark-Lite" lfm-reports/report.html
+          grep -q "V10 Advanced Boltzmann" lfm-reports/report.html
           python - <<'PY'
           import json
           d=json.load(open('lfm-reports/benchmark.json'))
@@ -132,23 +165,38 @@ jobs:
           assert d['model']['target_parameter_count'] > 300_000_000
           assert d['model']['target_vocab_size'] == 65536
           assert 200 < d['model']['candidate_size'] <= 2048
-          assert d['mean_candidate_coverage'] > 0
-          assert d['config']['max_new_tokens'] == 16
-          assert d['config']['repeats'] == 2
+          assert d['config']['max_new_tokens'] == 24
+          assert d['config']['repeats'] == 3
           assert d['config']['prompt_count'] == 6
-          assert d['showcase']['live_demo_count'] == 2
-          expected=('normal','dflash','dflash2','dflash3_mobs','dflash4_jump_mobs','dflash5_fused_jump_mobs','dflash6_boltzmann','dflash6_bmobs','dflash7_act')
+          expected=(
+              'normal','dflash','dflash2','dflash3_mobs','dflash4_jump_mobs',
+              'dflash5_fused_jump_mobs','dflash6_boltzmann','dflash6_bmobs','dflash7_act',
+              'dspark_v9','boltzmann_v10'
+          )
           for method in expected:
               assert d['summary'][method]['all_exact'], method
               assert d['summary'][method]['tokens_per_second_median'] > 0, method
               assert d['summary'][method]['speedup_vs_normal'] > 0, method
-          assert d['summary']['normal']['mean_target_forward_passes'] == d['config']['max_new_tokens']
-          assert d['summary']['dflash6_boltzmann']['mean_total_guidance_scores'] > 0
-          assert d['summary']['dflash6_bmobs']['mean_total_guidance_scores'] > 0
-          assert d['dflash7_calibration']['held_out_from_benchmark'] is True
-          assert all(x['all_exact'] for x in d['dflash7_calibration']['candidates'])
           assert d['winner'] in expected
-          print(json.dumps({'winner':d['winner'],'summary':d['summary'],'act':d['dflash7_calibration']}, indent=2))
+          assert d['dspark_v9']['parameter_count'] > 0
+          assert d['dspark_v9']['parameter_count'] < 2_000_000
+          assert d['dspark_v9']['training']['markov_steps'] == 180
+          assert d['dspark_v9']['training']['confidence_steps'] == 100
+          assert d['boltzmann_v10']['training_steps'] == 0
+          plan=d['boltzmann_v10']['calibration']['plan']
+          assert plan['calibration_work_reduction_fraction'] > 0
+          assert d['summary']['boltzmann_v10']['mean_v10_candidate_scores'] > 0
+          assert d['summary']['boltzmann_v10']['mean_total_guidance_scores'] < d['summary']['dflash6_boltzmann']['mean_total_guidance_scores']
+          assert all(x['all_exact'] for x in d['dspark_v9']['calibration'])
+          assert all(x['all_exact'] for x in d['boltzmann_v10']['calibration']['stage2'])
+          print(json.dumps({
+              'winner': d['winner'],
+              'dflash': d['summary']['dflash'],
+              'dflash6_boltzmann': d['summary']['dflash6_boltzmann'],
+              'dspark_v9': d['summary']['dspark_v9'],
+              'boltzmann_v10': d['summary']['boltzmann_v10'],
+              'v10_config': d['boltzmann_v10']['selected_config'],
+          }, indent=2))
           PY
 
       - name: Write benchmark summary
@@ -156,16 +204,19 @@ jobs:
           python - <<'PY' >> "$GITHUB_STEP_SUMMARY"
           import json
           d=json.load(open('lfm-reports/benchmark.json'))
-          print('# LFM2.5-350M-Base · Normal + DFlash1–7')
+          print('# LFM2.5-350M · V9 DSpark + V10 Advanced Boltzmann')
           print(f"Winner: **{d['winner']}**")
-          print(f"Candidate vocabulary: {d['model']['candidate_size']} / {d['model']['target_vocab_size']}")
-          print(f"Mean candidate coverage: {100*d['mean_candidate_coverage']:.1f}%")
-          print(f"DFlash7 ACT threshold: {d['dflash7_calibration']['selected_threshold']}")
-          print('| Method | tok/s | speedup | acceptance | tokens/target pass | exact |')
+          print(f"Workload: {d['config']['benchmark_workload']}")
+          print('| Method | tok/s | vs normal | acceptance | guidance ops | exact |')
           print('|---|---:|---:|---:|---:|:---:|')
-          for name,s in d['summary'].items():
-              print(f"| {name} | {s['tokens_per_second_median']:.3f} | {s['speedup_vs_normal']:.3f}x | {100*s['mean_acceptance_rate']:.1f}% | {s['mean_tokens_per_target_pass']:.2f} | {'yes' if s['all_exact'] else 'NO'} |")
-          print('The HTML artifact contains an animated architecture plus two interactive data-driven demos.')
+          focus=('normal','dflash','dflash6_boltzmann','dspark_v9','boltzmann_v10')
+          for name in focus:
+              s=d['summary'][name]
+              print(f"| {name} | {s['tokens_per_second_median']:.3f} | {s['speedup_vs_normal']:.3f}x | {100*s['mean_acceptance_rate']:.1f}% | {s['mean_total_guidance_scores']:.1f} | {'yes' if s['all_exact'] else 'NO'} |")
+          p=d['boltzmann_v10']['calibration']['plan']
+          print(f"V10 calibration work reduction vs full grid: {100*p['calibration_work_reduction_fraction']:.1f}%")
+          print(f"V10 selected config: {d['boltzmann_v10']['selected_config']}")
+          print(f"DSpark selected survival floor: {d['dspark_v9']['selected_survival_floor']}")
           PY
 
       - name: Prepare combined GitHub Pages site
@@ -202,7 +253,7 @@ jobs:
           from pathlib import Path
           p=Path('pages/index.html')
           s=p.read_text()
-          nav="""<div style='position:sticky;top:8px;z-index:30;max-width:1240px;margin:8px auto;padding:8px 16px;border:1px solid #294963;border-radius:14px;background:#07111fee;backdrop-filter:blur(12px);font-family:system-ui'><b>LFM showcase</b> · <a style='color:#58d9ff' href='./lfm/'>LFM</a> · <a style='color:#58d9ff' href='./qwen17/'>Qwen1.7B</a> · <a style='color:#58d9ff' href='./eagle3/'>EAGLE3</a> · <a style='color:#58d9ff' href='./qwen06/'>Qwen0.6B</a> · <a style='color:#58d9ff' href='./tiny/'>Tiny</a></div>"""
+          nav="""<div style='position:sticky;top:8px;z-index:30;max-width:1240px;margin:8px auto;padding:8px 16px;border:1px solid #294963;border-radius:14px;background:#07111fee;backdrop-filter:blur(12px);font-family:system-ui'><b>V9/V10 LFM study</b> · <a style='color:#58d9ff' href='./lfm/'>LFM</a> · <a style='color:#58d9ff' href='./qwen17/'>Qwen1.7B</a> · <a style='color:#58d9ff' href='./eagle3/'>EAGLE3</a> · <a style='color:#58d9ff' href='./qwen06/'>Qwen0.6B</a> · <a style='color:#58d9ff' href='./tiny/'>Tiny</a></div>"""
           s=s.replace('<body>', '<body>'+nav, 1)
           p.write_text(s)
           Path('pages/.nojekyll').touch()
