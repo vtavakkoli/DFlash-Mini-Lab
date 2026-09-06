@@ -1,0 +1,255 @@
+name: V11 Boltzmann-Gated MOBS CPU study
+
+on:
+  pull_request:
+    paths:
+      - "src/dflash_mini_lab/v11_*.py"
+      - ".github/workflows/v11-benchmark.yml"
+  push:
+    branches: [main]
+    paths:
+      - "src/dflash_mini_lab/v11_*.py"
+      - ".github/workflows/v11-benchmark.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: "v11-${{ github.ref }}"
+  cancel-in-progress: true
+
+jobs:
+  v11-lfm-cpu:
+    runs-on: ubuntu-latest
+    timeout-minutes: 140
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Restore Hugging Face model cache
+        uses: actions/cache@v4
+        with:
+          path: hf-cache
+          key: lfm25-350m-base-${{ runner.os }}-transformers5161-v1
+
+      - name: Build and compile V11 image
+        run: |
+          docker build -f Dockerfile.lfm -t dflash-v11 .
+          docker run --rm dflash-v11 python -m py_compile \
+            /app/src/dflash_mini_lab/v11_boltzmann_mobs.py \
+            /app/src/dflash_mini_lab/v11_benchmark.py \
+            /app/src/dflash_mini_lab/lfm_v9v10_benchmark.py
+
+      - name: Prepare frozen DFlash auxiliaries
+        run: |
+          mkdir -p hf-cache lfm-artifacts
+          docker run --rm \
+            -e HF_HOME=/cache \
+            -e CPU_THREADS=2 \
+            -e OMP_NUM_THREADS=2 \
+            -e MKL_NUM_THREADS=2 \
+            -e OPENBLAS_NUM_THREADS=2 \
+            -v "$PWD/hf-cache:/cache" \
+            -v "$PWD/lfm-artifacts:/app/lfm-artifacts" \
+            dflash-v11 \
+            python -m dflash_mini_lab.lfm_prepare \
+              --model-id LiquidAI/LFM2.5-350M-Base \
+              --output-dir /app/lfm-artifacts \
+              --max-seed-count 40 \
+              --generation-tokens 32 \
+              --top-candidate-k 32 \
+              --candidate-limit 2048 \
+              --drafter-steps 300 \
+              --selector-steps 180 \
+              --jump-steps 120 \
+              --fused-steps 180 \
+              --cpu-threads 2
+
+      - name: Reproduce V9 DSpark heads
+        run: |
+          docker run --rm \
+            -e HF_HOME=/cache \
+            -e TRANSFORMERS_OFFLINE=1 \
+            -e HF_HUB_OFFLINE=1 \
+            -e CPU_THREADS=2 \
+            -e OMP_NUM_THREADS=2 \
+            -e MKL_NUM_THREADS=2 \
+            -e OPENBLAS_NUM_THREADS=2 \
+            -v "$PWD/hf-cache:/cache" \
+            -v "$PWD/lfm-artifacts:/app/lfm-artifacts" \
+            dflash-v11 \
+            python -m dflash_mini_lab.lfm_dspark \
+              --aux /app/lfm-artifacts/lfm_aux.pt \
+              --output /app/lfm-artifacts/lfm_dspark.pt \
+              --seeds /app/real_benchmarks/train_seeds.json \
+              --max-seed-count 40 \
+              --generation-tokens 32 \
+              --markov-rank 16 \
+              --markov-steps 180 \
+              --confidence-steps 100 \
+              --batch-size 64 \
+              --cpu-threads 2
+
+      - name: Run V11 calibrated and rotated contender benchmark
+        run: |
+          mkdir -p v11-reports
+          docker run --rm \
+            -e HF_HOME=/cache \
+            -e TRANSFORMERS_OFFLINE=1 \
+            -e HF_HUB_OFFLINE=1 \
+            -e CPU_THREADS=2 \
+            -e OMP_NUM_THREADS=2 \
+            -e MKL_NUM_THREADS=2 \
+            -e OPENBLAS_NUM_THREADS=2 \
+            -v "$PWD/hf-cache:/cache" \
+            -v "$PWD/lfm-artifacts:/app/lfm-artifacts:ro" \
+            -v "$PWD/v11-reports:/app/v11-reports" \
+            dflash-v11 \
+            python -m dflash_mini_lab.v11_benchmark \
+              --aux /app/lfm-artifacts/lfm_aux.pt \
+              --dspark /app/lfm-artifacts/lfm_dspark.pt \
+              --prompts /app/real_benchmarks/prompts.json \
+              --calibration-prompts /app/real_benchmarks/calibration_prompts.json \
+              --output-dir /app/v11-reports \
+              --tokens 24 \
+              --repeats 3 \
+              --prompt-limit 6 \
+              --calibration-tokens 8 \
+              --calibration-prompt-limit 4 \
+              --top-k 8 \
+              --jump-weight 0.5 \
+              --fused-weight 1.0 \
+              --boltzmann-temperature 0.15 \
+              --bmobs-temperature 0.35 \
+              --cpu-threads 2 \
+              --dtype float32
+
+      - name: Upload V11 diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lfm25-350m-v11-boltzmann-gated-mobs
+          path: |
+            v11-reports/
+            lfm-artifacts/manifest.json
+            lfm-artifacts/distillation.json
+            lfm-artifacts/lfm_aux.pt
+            lfm-artifacts/lfm_dspark.pt
+          retention-days: 30
+
+      - name: Validate V11 exactness and low-operation gate
+        run: |
+          test -s v11-reports/benchmark.json
+          test -s v11-reports/report.html
+          grep -q "V11 · Boltzmann-Gated MOBS" v11-reports/report.html
+          grep -q "Live demo 1" v11-reports/report.html
+          grep -q "Live demo 2" v11-reports/report.html
+          grep -q "Animated architecture" v11-reports/report.html
+          python - <<'PY'
+          import json
+          d=json.load(open('v11-reports/benchmark.json'))
+          v=d['v11']
+          assert d['model']['id'] == 'LiquidAI/LFM2.5-350M-Base'
+          assert d['config']['max_new_tokens'] == 24
+          assert d['config']['repeats'] == 3
+          assert d['config']['prompt_count'] == 6
+          assert v['training_steps'] == 0
+          assert v['calibration']['plan']['calibration_work_reduction_fraction'] > 0
+          assert all(x['all_exact'] for x in v['calibration']['stage2'])
+          expected=('normal','dflash','dflash3_mobs','dspark_v9','boltzmann_v10','boltzmann_gated_mobs_v11')
+          for method in expected:
+              s=v['focus_summary'][method]
+              assert s['all_exact'], method
+              assert s['tokens_per_second_median'] > 0, method
+          s=v['focus_summary']['boltzmann_gated_mobs_v11']
+          assert s['mean_gate_evaluations'] > 0
+          assert s['mean_pair_scores'] >= 0
+          assert s['mean_total_guidance_scores'] < v['focus_summary']['dflash3_mobs']['mean_total_guidance_scores']
+          assert s['mean_fast_argmax_positions'] > 0
+          print(json.dumps({
+              'winner': v['focus_winner'],
+              'lead_vs_next': v['lead_vs_next_fraction'],
+              'clear_winner': v['clear_winner'],
+              'selected_config': v['selected_config'],
+              'summary': v['focus_summary'],
+          }, indent=2))
+          PY
+
+      - name: Write V11 benchmark summary
+        run: |
+          python - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json
+          d=json.load(open('v11-reports/benchmark.json')); v=d['v11']
+          print('# V11 Boltzmann-Gated MOBS')
+          print(f"Focused winner: **{v['focus_winner']}**")
+          print(f"Lead vs second: **{100*v['lead_vs_next_fraction']:.2f}%**")
+          print(f"Clear V11 winner (>=2% lead): **{v['clear_winner']}**")
+          print('| Method | tok/s | vs normal | acceptance | guidance ops | exact |')
+          print('|---|---:|---:|---:|---:|:---:|')
+          for name,s in sorted(v['focus_summary'].items(), key=lambda kv: kv[1]['tokens_per_second_median'], reverse=True):
+              print(f"| {name} | {s['tokens_per_second_median']:.3f} | {s['speedup_vs_normal']:.3f}x | {100*s['mean_acceptance_rate']:.1f}% | {s['mean_total_guidance_scores']:.1f} | {'yes' if s['all_exact'] else 'NO'} |")
+          print(f"Selected V11 config: `{v['selected_config']}`")
+          PY
+
+      - name: Prepare combined Pages site
+        if: github.event_name != 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          rm -rf pages /tmp/v10 /tmp/eagle /tmp/q17 /tmp/q06 /tmp/tiny
+          mkdir -p pages/lfm pages/v11
+          cp v11-reports/report.html pages/index.html
+          cp v11-reports/report.html pages/lfm/index.html
+          cp v11-reports/report.html pages/v11/index.html
+          cp v11-reports/benchmark.json pages/lfm/benchmark.json
+          cp v11-reports/benchmark.json pages/v11/benchmark.json
+
+          fetch_artifact () {
+            name="$1"; dest="$2"; zip="$3"
+            id=$(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts?name=$name&per_page=20" --jq '.artifacts | map(select(.expired==false)) | .[0].id // empty')
+            if [ -n "$id" ]; then mkdir -p "$dest"; gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$id/zip" > "$zip"; unzip -q "$zip" -d "$dest"; fi
+          }
+          fetch_artifact lfm25-350m-v9-v10-showcase /tmp/v10 /tmp/v10.zip || true
+          fetch_artifact eagle3-v8-qwen3-17b-benchmark /tmp/eagle /tmp/eagle.zip || true
+          fetch_artifact qwen3-17b-all-methods-benchmark /tmp/q17 /tmp/q17.zip || true
+          fetch_artifact qwen3-06b-dflash7-benchmark /tmp/q06 /tmp/q06.zip || true
+          fetch_artifact dflash-cpu-report /tmp/tiny /tmp/tiny.zip || true
+
+          if [ -s /tmp/v10/lfm-reports/report.html ]; then mkdir -p pages/lfm-v10; cp /tmp/v10/lfm-reports/report.html pages/lfm-v10/index.html; cp /tmp/v10/lfm-reports/benchmark.json pages/lfm-v10/benchmark.json; fi
+          if [ -s /tmp/eagle/report.html ]; then mkdir -p pages/eagle3; cp /tmp/eagle/report.html pages/eagle3/index.html; cp /tmp/eagle/benchmark.json pages/eagle3/benchmark.json; fi
+          if [ -s /tmp/q17/qwen17-reports/report.html ]; then mkdir -p pages/qwen17; cp -r /tmp/q17/qwen17-reports/* pages/qwen17/; fi
+          if [ -s /tmp/q06/qwen-reports/report.html ]; then mkdir -p pages/qwen06; cp -r /tmp/q06/qwen-reports/* pages/qwen06/; fi
+          if [ -s /tmp/tiny/report.html ]; then mkdir -p pages/tiny; cp -r /tmp/tiny/* pages/tiny/; fi
+
+          python - <<'PY'
+          from pathlib import Path
+          p=Path('pages/index.html'); s=p.read_text()
+          nav="""<div style='position:sticky;top:8px;z-index:30;max-width:1200px;margin:8px auto;padding:8px 16px;border:1px solid #294963;border-radius:14px;background:#07111fee;backdrop-filter:blur(12px);font-family:system-ui'><b>V11 LFM study</b> · <a style='color:#58d9ff' href='./v11/'>V11</a> · <a style='color:#58d9ff' href='./lfm-v10/'>V9/V10</a> · <a style='color:#58d9ff' href='./qwen17/'>Qwen1.7B</a> · <a style='color:#58d9ff' href='./eagle3/'>EAGLE3</a> · <a style='color:#58d9ff' href='./qwen06/'>Qwen0.6B</a> · <a style='color:#58d9ff' href='./tiny/'>Tiny</a></div>"""
+          p.write_text(s.replace('<body>', '<body>'+nav, 1)); Path('pages/.nojekyll').touch()
+          PY
+
+      - name: Upload GitHub Pages artifact
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: pages
+
+  deploy-pages:
+    if: github.event_name != 'pull_request'
+    needs: v11-lfm-cpu
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      pages: write
+      id-token: write
+      actions: read
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy V11 benchmark site
+        id: deployment
+        uses: actions/deploy-pages@v4
