@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dflash-mini-lab"
-version = "1.2.0"
-description = "Reproducible CPU benchmark lab for DFlash-style speculative decoding with tiny, LFM2.5 and Qwen3 real-model paths"
+version = "1.3.0"
+description = "Reproducible CPU benchmark lab for DFlash-style speculative decoding, including DFlash12 Parareal linear residual correction"
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "MIT"}
@@ -25,6 +25,8 @@ dflash-lfm-prepare = "dflash_mini_lab.lfm_prepare:main"
 dflash-lfm-benchmark = "dflash_mini_lab.lfm_cli:main"
 dflash-qwen-prepare = "dflash_mini_lab.qwen_prepare:main"
 dflash-qwen-benchmark = "dflash_mini_lab.qwen_cli:main"
+dflash-v12-prepare = "dflash_mini_lab.v12_prepare:main"
+dflash-v12-benchmark = "dflash_mini_lab.v12_benchmark:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
