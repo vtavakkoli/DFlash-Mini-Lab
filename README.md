@@ -1,219 +1,170 @@
 # DFlash Mini Lab
 
-A reproducible **CPU-only speculative-decoding benchmark and visualization lab**. The repository contains the original eight-way tiny reference benchmark plus separate real-model paths for LFM2.5 and **Qwen3-0.6B-Base**.
-
-The tiny reference workload compares:
-
-1. **Normal autoregressive decoding**
-2. **DFlash-style** parallel block speculative decoding
-3. **DFlash v2-style** multi-candidate dynamic-programming path selection
-4. **DFlash3-MOBS** — experimental O(BK) middle-out bidirectional selection
-5. **DFlash4-JUMP-MOBS** — sparse indexed future-token anchors + O(BK) gap filling
-6. **DFlash5-FUSED-JUMP-MOBS** — shared-drafter sparse jump guidance with zero extra jump forward pass
-7. **DFlash6-Boltzmann** — training-free deterministic Boltzmann/Gumbel exploration of existing draft candidates
-8. **DFlash6-BMOBS** — one Boltzmann middle anchor followed by O(BK) MOBS gap filling
-
-The Qwen path additionally evaluates **DFlash7-ACT**, an adaptive cost-aware speculative router on a real cached verifier.
+A reproducible, CPU-oriented research lab for speculative decoding mechanisms. The repository contains compact educational implementations, real-model LFM2.5 and Qwen paths, exact greedy verification, benchmark tooling, and versioned experiments from DFlash-style block drafting through **DFlash12-PARAREAL**.
 
 > [!IMPORTANT]
-> This repository is a **mechanism-level educational/reference implementation**, not the official DFlash/DFlash2 runtime or training recipe. DFlash3 through DFlash7 are experiments introduced in this lab. Every speculative proposal is verified by the same target model and checked against normal greedy output.
+> This repository is a mechanism-level research/reference implementation. It is **not** the official DFlash, DFlash2, EAGLE, vLLM, SGLang, or vendor runtime. Experimental versions introduced here are named for this lab and should not be presented as upstream algorithms.
 
-## Live tiny benchmark
+## Current research focus: DFlash12-PARAREAL
 
-The GitHub Pages report is rebuilt from the tiny CPU Docker benchmark and published only after exactness and artifact checks pass:
+**DFlash12-PARAREAL** transfers the coarse/fine residual-correction idea of Parareal into speculative decoding while keeping the block correction parallel and extremely small.
 
-**https://vtavakkoli.github.io/DFlash-Mini-Lab/**
+The mapping is:
 
-## Real Qwen3-0.6B benchmark — DFlash7-ACT
+- **coarse propagator `G`**: the existing DFlash top-k block-logit field;
+- **fine propagator `F` during preparation only**: frozen target-model teacher logits on greedy trajectories;
+- **residual surrogate**: a closed-form ridge/least-squares model trained to predict `F - q`;
+- **inference correction**: repeated affine residual updates over every block-position/candidate pair in parallel;
+- **authority**: the unchanged target verifier accepts the matching prefix and corrects the first mismatch.
 
-The Qwen benchmark fixes several fidelity/runtime limitations of the earlier tiny/LFM paths:
-
-```text
-Qwen3-0.6B-Base verifier
-        │
-        ├── DynamicCache KV state
-        ├── hidden layer 4
-        ├── hidden layer 14
-        └── hidden layer 27
-                 │
-                 ▼
-        learned hidden fusion
-                 │
-       verifier memory as K/V
-                 │
-                 ▼
- known greedy anchor + 5 mask slots
-                 │
-       2-layer bidirectional
-          block drafter
-                 │
-                 ▼
-        retained target-head rows
-                 │
-                 ▼
-           draft candidates
-                 │
-          ┌──────┴──────┐
-          │             │
-          ▼             ▼
- fixed DFlash      DFlash7-ACT
- full suffix       margin-gated suffix
-          │             │
-          └──────┬──────┘
-                 ▼
-       one Qwen verifier call
-                 │
-         accept exact prefix
-                 │
-                 ▼
-      DynamicCache.crop(reject)
-```
-
-The **anchor is not drafted**. It is the target verifier's already-known greedy bonus token from the previous logits. The drafter predicts only tokens after that exact anchor. Verification forwards `[anchor + draft suffix]` in one Qwen call, then crops rejected cache entries.
-
-### DFlash7-ACT
-
-**ACT = Adaptive Cost-aware Token speculation.** DFlash7 uses the already-computed top-1/top-2 draft-logit margin to shorten an uncertain suffix before it reaches the expensive verifier. It adds no neural forward pass. CI calibrates a bounded threshold set on separate prompts:
+The correction state is a continuous top-k logit field rather than token IDs. For correction round `k`:
 
 ```text
-0.00, 0.25, 0.50, 1.00, 1.50, 2.00
+q_0 = center(G)
+q_(k+1) = center(q_k + damping * R_linear(q_k, G, features))
 ```
 
-Threshold `0` is full fixed-block DFlash, so ACT can fall back to the baseline.
+`R_linear` is ordinary ridge regression. The default model has only eight standardized features plus an intercept. It is evaluated with vectorized NumPy over the complete `B × K` candidate field, so V12 adds **no neural correction forward pass** and introduces no position-by-position recurrence.
 
-### First verified Qwen result
+### Why Parareal here?
 
-Configuration:
+Classical Parareal alternates a cheap coarse approximation with a correction based on the difference between fine and coarse propagation. V12 keeps that residual-correction principle but adapts it to a speculative block:
 
-- target: `Qwen/Qwen3-0.6B-Base`, **596,049,920 parameters**;
-- target hidden size 1024, vocabulary 151,936;
-- retained draft vocabulary: **3,251 tokens**;
-- held-out continuation candidate coverage: **93.94%**;
-- hidden layers: 4 / 14 / 27;
-- hidden-memory window: 16 verifier tokens;
-- block size 6 = 1 exact anchor + 5 parallel draft slots;
-- drafter: 2 decoder layers, width 256, 8 heads, about **3.16M parameters**;
-- training: 24 Qwen teacher seeds × 18 generated tokens, 312 resulting block examples;
-- benchmark: 6 held-out prompts × 12 tokens × 2 repeats, float32 CPU / 2 threads;
-- decode timing excludes prefill.
+```text
+Frozen target teacher F  ───────┐
+                                │  preparation only
+DFlash coarse field G ──────────┼──> fit linear residual F-G
+                                │
+                                ▼
+                         v12_parareal.json
+                                │
+                                ▼
+DFlash block logits ──> q0 ──> q1 ──> q2 ──> proposal
+                         all B×K candidates corrected in parallel
+                                │
+                                ▼
+                         TARGET VERIFY
+                                │
+                                ▼
+                       exact greedy output
+```
 
-Measured PR run:
+The implementation records teacher-space mean-squared error, `log(MSE)`, contraction ratios, and fine top-1 agreement by correction round. These are preparation/holdout diagnostics; they are not used as an oracle at inference time.
 
-| Method | Median tok/s | vs normal | Draft acceptance | Mean target calls | Mean target input tokens | Exact |
-|---|---:|---:|---:|---:|---:|:---:|
-| Normal cached Qwen | **7.468** | **1.000×** | — | 11.00 | 11.00 | ✓ |
-| Hidden-fusion fixed DFlash | 3.634 | 0.487× | 2.81% | **10.17** | 52.33 | ✓ |
-| **DFlash7-ACT** | **7.000** | **0.937×** | 0.00% at selected policy | 11.00 | 11.83 | ✓ |
+## DFlash12 feature contract
 
-The bounded ACT calibration selected margin threshold **2.0**. On calibration prompts, full-block DFlash (`T=0`) measured about 3.994 tok/s, while the selected ACT policy measured about 7.269 tok/s by suppressing nearly all unprofitable speculative suffixes.
+For every retained candidate, the linear model receives:
 
-This is an intentionally preserved negative end-to-end result: **DFlash7 does not beat normal cached Qwen in this small CPU experiment.** It does, however, recover most of the severe fixed-DFlash penalty by identifying that the current drafter is not profitable on held-out prompts.
+1. current centered candidate score;
+2. original coarse centered score;
+3. candidate rank within the coarse top-k set;
+4. normalized block position;
+5. coarse top-1/top-2 margin;
+6. candidate-embedding similarity to the last prefix token;
+7. candidate-embedding similarity to the prefix-mean embedding;
+8. current-score × block-position interaction.
 
-The key diagnostic is generalization. The drafter's training-position accuracies were approximately **43.6%, 25.3%, 19.9%, 17.3%, 16.3%**, while held-out accepted-prefix rate was much lower. With only 312 Qwen teacher examples, the bottleneck is now drafter data/generalization rather than missing anchor or KV-cache semantics.
+Training augments each teacher block with intermediate points between the coarse and fine fields. This teaches the same affine residual model to correct not only `q0`, but also partially corrected states.
 
-> [!NOTE]
-> This Qwen drafter is substantially closer to DFlash than the original educational path, but it is still not an official DFlash checkpoint or exact upstream recipe. It uses three selected target layers, a 16-token hidden-memory window, a 2-layer cross-attention decoder, a reduced candidate vocabulary and a D-PACE-inspired loss rather than the complete upstream training stack.
+## Version map
 
-### Run the Qwen benchmark
+| Version | Experiment | Main idea |
+|---|---|---|
+| DFlash | Parallel block drafting | Predict a future block, then verify with target |
+| DFlash2-style | Dynamic-programming path selection | Top-k candidates with predecessor-conditioned scoring |
+| DFlash3-MOBS | Middle-out bidirectional selection | O(BK) local path construction |
+| DFlash4-JUMP-MOBS | Sparse jump anchors | Predict selected future positions, fill gaps |
+| DFlash5-FUSED-JUMP-MOBS | Fused sparse residual | Reuse drafter hidden states, remove separate jump forward |
+| DFlash6 | Boltzmann / BMOBS | Deterministic training-free exploration |
+| DFlash7-ACT | Adaptive speculation | Shorten uncertain verifier suffixes on cached Qwen |
+| V8 | EAGLE3-oriented experiment | Separate EAGLE3 comparison path |
+| V9 DSpark-Lite | Low-rank Markov correction | Frozen DFlash backbone + confidence head |
+| V10 Advanced Boltzmann | Cost-aware candidate exploration | Training-free selection refinements |
+| V11 Boltzmann-Gated MOBS | Sparse uncertainty routing | Send only uncertain slots through MOBS |
+| **V12 PARAREAL** | **Parallel linear residual correction** | **Least-squares approximation of fine-minus-coarse logit residual** |
+
+## DFlash12 preparation
+
+V12 is trained offline from frozen teacher trajectories. The target model is used only to build the regression data; target weights are not written into the V12 JSON artifact.
 
 ```bash
-docker build -f Dockerfile.qwen -t dflash-qwen7 .
-
-# 1. Build the small hidden-fusion drafter from the frozen Qwen target.
-docker run --rm \
-  -v "$PWD/hf-qwen-cache:/cache" \
-  -v "$PWD/qwen-artifacts:/app/qwen-artifacts" \
-  dflash-qwen7 \
-  python -m dflash_mini_lab.qwen_prepare \
-    --model-id Qwen/Qwen3-0.6B-Base \
-    --output-dir /app/qwen-artifacts
-
-# 2. Benchmark normal cached Qwen, fixed DFlash and DFlash7-ACT.
-docker run --rm \
-  -e TRANSFORMERS_OFFLINE=1 \
-  -e HF_HUB_OFFLINE=1 \
-  -v "$PWD/hf-qwen-cache:/cache" \
-  -v "$PWD/qwen-artifacts:/app/qwen-artifacts:ro" \
-  -v "$PWD/qwen-reports:/app/qwen-reports" \
-  dflash-qwen7 \
-  python -m dflash_mini_lab.qwen_cli \
-    --aux /app/qwen-artifacts/qwen_dflash.pt \
-    --output-dir /app/qwen-reports
+python -m dflash_mini_lab.v12_prepare \
+  --aux lfm-artifacts/lfm_aux.pt \
+  --seeds real_benchmarks/train_seeds.json \
+  --output lfm-artifacts/v12_parareal.json \
+  --top-k 8 \
+  --correction-rounds 2 \
+  --damping 0.75 \
+  --ridge 0.001
 ```
 
-The target weights are downloaded from Hugging Face and are **not** committed or redistributed by this repository.
+The preparation command:
 
-## DFlash6 in one picture
+- generates deterministic greedy teacher trajectories;
+- performs one causal teacher pass per completed trajectory for reusable fine logits;
+- collects DFlash top-k coarse scores;
+- fits the linear `F-G` residual with closed-form ridge regression;
+- uses an internal holdout split;
+- stores train/holdout convergence diagnostics in the JSON artifact.
+
+## DFlash12 benchmark
+
+The real LFM comparison keeps final target verification identical across speculative methods and checks every generated sequence against normal target-only greedy decoding.
+
+```bash
+python -m dflash_mini_lab.v12_benchmark \
+  --aux lfm-artifacts/lfm_aux.pt \
+  --dspark lfm-artifacts/lfm_dspark.pt \
+  --v12-model lfm-artifacts/v12_parareal.json \
+  --prompts real_benchmarks/test_prompts.json \
+  --output-dir v12-reports \
+  --tokens 24 \
+  --repeats 2
+```
+
+Outputs:
 
 ```text
-parallel DFlash draft logits
-           │
-           ▼
-    top-k candidates
-           │
-   top-1/top-2 margin
-           │
-           ▼
- adaptive temperature
-   high confidence → T↓
-   uncertainty     → T↑
-           │
-      ┌────┴────┐
-      │         │
-      ▼         ▼
- Boltzmann    BMOBS
- Gumbel-Max   sample one
- every slot   middle anchor
-      │         │
-      │      O(BK) fill
-      └────┬────┘
-           ▼
-      TARGET VERIFY
-           ▼
-   exact greedy output
+v12-reports/v12_benchmark.json
+v12-reports/v12_benchmark.md
 ```
 
-DFlash6 adds **no model weights and no model forward pass**. Its Gumbel values are derived deterministically from the current context/token IDs, so CI remains reproducible rather than depending on nondeterministic RNG state.
+The benchmark compares:
 
-### DFlash6-Boltzmann
+- Normal LFM greedy decoding;
+- plain DFlash;
+- V11 Boltzmann-Gated MOBS;
+- V12 PARAREAL Linear.
 
-The drafter's top-k candidates are sampled with deterministic Gumbel-Max. The base temperature is reduced automatically when the top-1/top-2 logit margin is large, making confident slots behave close to normal DFlash argmax.
+It records end-to-end tok/s, target/draft/selection time, target-forward count, acceptance, tokens per target pass, V12 linear-candidate work, and exactness.
 
-### DFlash6-BMOBS
+## Synthetic convergence regression test
 
-For even blocks, BMOBS chooses the more uncertain of the two center positions, samples that anchor with Boltzmann/Gumbel scoring, and fills the remaining positions with the existing linear MOBS neighbor scorer.
-
-## What the first full DFlash6 run showed
-
-On the initial 8 prompts × 24 tokens × 5 repeats PR run, the bounded sweep selected:
+The unit test intentionally uses a synthetic affine fine/coarse relationship where the residual is representable by the V12 feature model. This verifies the numerical mechanism independently from real-model quality. In the development run used to introduce V12, the synthetic holdout MSE behaved approximately as:
 
 ```text
-DFlash6-Boltzmann temperature: 0.35
-DFlash6-BMOBS temperature:     0.20
+round 0: 0.1863
+round 1: 0.0123
+round 2: 0.00084
 ```
 
-The same run measured:
+That result validates the implementation's geometric-convergence behavior on a controlled affine problem. It is **not** an LFM throughput or quality result.
 
-- plain DFlash acceptance: **47.83%**;
-- Boltzmann acceptance: **50.55%**;
-- BMOBS acceptance: **53.18%**;
-- Boltzmann and BMOBS remained exact after target verification;
-- Boltzmann used no learned pair selector;
-- BMOBS used about **81% less guidance work than DFlash2**;
-- neither new mode beat plain DFlash in end-to-end CPU throughput because top-k/Gumbel/neighbor-selection overhead exceeded the saved verifier work.
+Run tests with:
 
-This negative throughput result is preserved rather than tuning until a runner produces a desired ranking.
+```bash
+pytest -q
+```
 
-## Bounded optimization
+## Qwen3-0.6B path: DFlash7-ACT
 
-CI performs bounded, reproducible searches rather than open-ended tuning:
+The cached Qwen path remains separate from V12. It uses `DynamicCache`, a learned hidden-fusion block drafter, one known greedy anchor, speculative suffix verification, and cache cropping after rejection. DFlash7-ACT uses top-1/top-2 draft margin to suppress unprofitable suffixes.
 
-- DFlash5: fixed fused-weight / margin candidates;
-- DFlash6-Boltzmann: temperatures `0.02, 0.05, 0.10, 0.20, 0.35`;
-- DFlash6-BMOBS: the same temperature set, optimized independently;
-- DFlash7-ACT: verifier-suffix margin thresholds `0, 0.25, 0.5, 1, 1.5, 2`, calibrated on separate Qwen prompts.
+The preserved first Qwen result is intentionally negative end-to-end: the small drafter did not beat normal cached Qwen on the measured CPU workload. The repository keeps this result because acceptance and speculative sophistication do not automatically imply wall-clock speedup.
 
-## One-command tiny Docker benchmark
+## Tiny reference path
+
+The original tiny Docker benchmark remains useful for mechanism-level regression tests and visualization. Its target intentionally recomputes the visible sequence and should not be compared with production serving numbers from llama.cpp, vLLM, SGLang, or vendor runtimes.
 
 ```bash
 docker build -t dflash-mini-lab .
@@ -223,47 +174,44 @@ docker run --rm \
   -e OMP_NUM_THREADS=1 \
   -e MKL_NUM_THREADS=1 \
   -v "$PWD/reports:/app/reports" \
-  dflash-mini-lab \
-  --top-k 8 \
-  --mobs-refine-passes 0 \
-  --jump-weight 0.5 \
-  --fused-jump-weight 1.0 \
-  --boltzmann-temp 0.35 \
-  --bmobs-temp 0.20
+  dflash-mini-lab
 ```
-
-## Benchmark methodology
-
-The tiny GitHub CI path uses one CPU/BLAS thread, 8 fixed prompts, 24 generated tokens per prompt, one warm-up, five measured repeats, block size 4 and top-k 8. Every speculative method is verified against the same target-only greedy reference.
-
-The tiny target intentionally recomputes the visible sequence and has no production KV cache. Its absolute throughput should therefore **not** be compared directly with llama.cpp/vLLM/SGLang production serving numbers. The Qwen path is separate and uses a real DynamicCache verifier.
 
 ## Repository layout
 
 ```text
-benchmarks/prompts.json                    tiny fixed workload
-training/build_weights.py                  deterministic tiny model/speculator builder
-src/dflash_mini_lab/runtime.py             NumPy tiny target + learned selectors
-src/dflash_mini_lab/boltzmann.py           deterministic DFlash6 sampling/selectors
-src/dflash_mini_lab/decoding.py            tiny eight-way decoding + exact correction
-src/dflash_mini_lab/qwen_aux.py            hidden-fusion Qwen block drafter
-src/dflash_mini_lab/qwen_prepare.py        Qwen teacher generation + drafter training
-src/dflash_mini_lab/qwen_runtime.py        cached Qwen verifier + rollback
-src/dflash_mini_lab/qwen_benchmark.py      Normal / DFlash / DFlash7 benchmark
-qwen_benchmarks/                           Qwen train, calibration and test prompts
-Dockerfile.qwen                            reproducible Qwen CPU environment
-.github/workflows/qwen-dflash7.yml         real Qwen exactness/performance CI
+src/dflash_mini_lab/runtime.py             tiny NumPy reference runtime
+src/dflash_mini_lab/decoding.py            tiny speculative methods + verification
+src/dflash_mini_lab/lfm_runtime.py          real LFM reference runtime
+src/dflash_mini_lab/lfm_dspark.py           V9 DSpark-Lite runtime/training
+src/dflash_mini_lab/lfm_v10.py              V10 configuration/selection
+src/dflash_mini_lab/v11_boltzmann_mobs.py   V11 uncertainty-gated MOBS
+src/dflash_mini_lab/v11_benchmark.py         V11 real-model benchmark
+src/dflash_mini_lab/v12_parareal.py          V12 regression + parallel correction core
+src/dflash_mini_lab/v12_prepare.py           V12 teacher-data and least-squares preparation
+src/dflash_mini_lab/v12_benchmark.py         V12 exactness/performance benchmark
+src/dflash_mini_lab/qwen_runtime.py          cached Qwen verifier + rollback
+src/dflash_mini_lab/qwen_benchmark.py        Normal / DFlash / DFlash7 benchmark
+tests/test_v12_parareal.py                   V12 convergence/determinism/artifact tests
+docs/algorithm.md                            algorithm and complexity notes
+docs/reproducibility.md                      reproducibility contract
+docs/version12-parareal.md                   V12 design, equations, claims and limitations
 ```
+
+## Documentation
+
+- [`docs/algorithm.md`](docs/algorithm.md) — algorithm families, equations, complexity and exactness.
+- [`docs/reproducibility.md`](docs/reproducibility.md) — deterministic settings, artifact contract and benchmark interpretation.
+- [`docs/version8-eagle3.md`](docs/version8-eagle3.md) — V8/EAGLE3 experiment notes.
+- [`docs/version12-parareal.md`](docs/version12-parareal.md) — complete V12 design and research protocol.
 
 ## References
 
-- Jian Chen, Yesheng Liang, Zhijian Liu. **DFlash: Block Diffusion for Flash Speculative Decoding.** arXiv:2602.06036 (2026).
+- J. Chen, Y. Liang, Z. Liu. **DFlash: Block Diffusion for Flash Speculative Decoding.** arXiv:2602.06036, 2026.
 - Official DFlash project: https://github.com/z-lab/dflash
-- vLLM Speculators documentation: https://docs.vllm.ai/projects/speculators/en/latest/user_guide/algorithms/
-- NVIDIA Model Optimizer DFlash documentation/examples.
-- Qwen3 model family: `Qwen/Qwen3-0.6B-Base`.
-
-See [`docs/algorithm.md`](docs/algorithm.md) for implementation scope.
+- V. Tavakkoli et al. **Parareal Contribution to Speeding-Up the Solving of Nonlinear Ordinary Differential Equations on Parallel/Multi-Core Platforms for Sensing Systems.** The Parareal coarse/fine residual-correction principle motivates V12; the decoding implementation is an adaptation, not a claim of mathematical equivalence to the ODE solver.
+- vLLM Speculators documentation.
+- Qwen3 model family documentation.
 
 ## License
 
