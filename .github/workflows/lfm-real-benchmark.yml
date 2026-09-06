@@ -76,15 +76,10 @@ jobs:
             python -m dflash_mini_lab.lfm_prepare \
               --model-id LiquidAI/LFM2.5-350M-Base \
               --output-dir /app/lfm-artifacts \
-              --max-seed-count 40 \
-              --generation-tokens 32 \
-              --top-candidate-k 32 \
-              --candidate-limit 2048 \
-              --drafter-steps 300 \
-              --selector-steps 180 \
-              --jump-steps 120 \
-              --fused-steps 180 \
-              --cpu-threads 2
+              --max-seed-count 40 --generation-tokens 32 \
+              --top-candidate-k 32 --candidate-limit 2048 \
+              --drafter-steps 300 --selector-steps 180 \
+              --jump-steps 120 --fused-steps 180 --cpu-threads 2
 
       - name: Prepare V9 DSpark-Lite heads
         run: |
@@ -98,13 +93,9 @@ jobs:
               --aux /app/lfm-artifacts/lfm_aux.pt \
               --output /app/lfm-artifacts/lfm_dspark.pt \
               --seeds /app/real_benchmarks/train_seeds.json \
-              --max-seed-count 40 \
-              --generation-tokens 32 \
-              --markov-rank 16 \
-              --markov-steps 180 \
-              --confidence-steps 100 \
-              --batch-size 64 \
-              --cpu-threads 2
+              --max-seed-count 40 --generation-tokens 32 \
+              --markov-rank 16 --markov-steps 180 \
+              --confidence-steps 100 --batch-size 64 --cpu-threads 2
 
       - name: Prepare V12 PARAREAL linear residual model
         run: |
@@ -118,13 +109,9 @@ jobs:
               --aux /app/lfm-artifacts/lfm_aux.pt \
               --output /app/lfm-artifacts/v12_parareal.json \
               --seeds /app/real_benchmarks/train_seeds.json \
-              --max-seed-count 24 \
-              --generation-tokens 24 \
-              --top-k 8 \
-              --correction-rounds 2 \
-              --damping 0.75 \
-              --holdout-fraction 0.20 \
-              --cpu-threads 2
+              --max-seed-count 24 --generation-tokens 24 \
+              --top-k 8 --correction-rounds 2 --damping 0.75 \
+              --holdout-fraction 0.20 --cpu-threads 2
 
       - name: Run Normal + 12 speculative methods on LFM2.5
         run: |
@@ -143,18 +130,13 @@ jobs:
               --prompts /app/real_benchmarks/prompts.json \
               --calibration-prompts /app/real_benchmarks/calibration_prompts.json \
               --output-dir /app/lfm-reports \
-              --tokens 24 \
-              --repeats 3 \
-              --prompt-limit 6 \
-              --calibration-tokens 8 \
-              --calibration-prompt-limit 3 \
-              --top-k 8 \
-              --jump-weight 0.5 \
-              --fused-weight 1.0 \
-              --boltzmann-temperature 0.15 \
-              --bmobs-temperature 0.35 \
-              --cpu-threads 2 \
-              --dtype float32
+              --tokens 24 --repeats 3 --prompt-limit 6 \
+              --calibration-tokens 8 --calibration-prompt-limit 3 \
+              --top-k 8 --jump-weight 0.5 --fused-weight 1.0 \
+              --boltzmann-temperature 0.15 --bmobs-temperature 0.35 \
+              --cpu-threads 2 --dtype float32
+          sed -i 's/Cross-model Qwen\/EAGLE results are intentionally excluded from this site\./Only LFM2.5 results are published on this site./g' \
+            lfm-reports/report.html lfm-reports/index.html
 
       - name: Validate one-model all-12 evidence
         run: |
@@ -179,7 +161,6 @@ jobs:
             'dflash7_act','dspark_v9','boltzmann_v10',
             'boltzmann_gated_mobs_v11','parareal_linear_v12'
           )
-          assert len(expected)==13
           assert len(d['summary'])==13
           for method in expected:
               s=d['summary'][method]
