@@ -2,147 +2,163 @@
 
 ## Status
 
-DFlash12-PARAREAL is an experimental algorithm introduced in this repository. It is inspired by the coarse/fine residual-correction structure of the Parareal method for time-parallel numerical integration. It is **not** an implementation of the classical ODE Parareal solver, and no mathematical equivalence is claimed.
+DFlash12-PARAREAL is an experimental algorithm introduced in this repository and evaluated only in the canonical **LFM2.5-350M All-12** study.
 
-The goal is narrower: use a cheap coarse speculative block, learn a compact approximation to the target-minus-coarse residual, apply that correction to all future positions in parallel, and retain exact target verification.
+It is inspired by the coarse/fine residual-correction structure of Parareal for time-parallel numerical integration. It is **not** an implementation of the classical ODE Parareal solver, and no mathematical equivalence is claimed.
 
-## 1. Mapping from Parareal to speculative decoding
+The design goal is specific: start from a cheap parallel DFlash block, learn a very small approximation to the target-minus-coarse residual, apply that correction to every retained candidate in parallel, and keep exact target verification.
 
-Classical Parareal combines a cheap coarse propagator `G` and an expensive fine propagator `F`. DFlash12 uses the following analogy:
+## 1. Parareal mapping
 
 | Parareal concept | DFlash12 interpretation |
 |---|---|
-| coarse propagator `G` | DFlash top-k candidate logits for the full speculative block |
-| fine propagator `F` | frozen target-model logits on teacher trajectories, used only during preparation |
-| fine-minus-coarse residual | target top-k score field minus DFlash top-k score field |
-| correction iteration | one vectorized affine residual update over all retained candidates |
-| convergence error | teacher-space top-k score MSE on preparation/holdout examples |
+| coarse propagator `G` | DFlash top-k candidate score field |
+| fine propagator `F` | frozen LFM2.5 teacher scores, preparation only |
+| fine-minus-coarse residual | target score field minus current corrected score field |
+| correction iteration | one vectorized affine residual update over all `B × K` rows |
+| convergence error | teacher-space top-k score MSE |
 | time intervals | speculative block positions |
-| final physical solution | exact target-verified greedy continuation |
+| final physical solution | exact target-verified continuation |
 
-The important design choice is that correction happens in **continuous score space**, not token-ID space. Token IDs are categorical identifiers and do not support meaningful subtraction.
+The correction is performed in **continuous score space**, not token-ID space. Token IDs are categorical identifiers and are never added or subtracted.
 
-## 2. State and candidate field
+## 2. State representation
 
-Let block length be `B` and retained candidate width be `K`. DFlash produces candidate scores
+For block length `B` and retained candidate width `K`, DFlash provides:
 
 ```text
-G in R^(B x K)
+G ∈ R^(B × K)
 ```
 
-for a fixed top-k candidate set at each future position. Scores are centered per position because additive logit offsets do not change ranking:
+Scores are centered per position because an additive logit offset does not change ranking:
 
 ```text
 center(z_i) = z_i - mean(z_i)
 ```
 
-The initial V12 state is
+The initial state is:
 
 ```text
-q_0 = center(G)
+q₀ = center(G)
 ```
 
-The frozen target supplies the teacher/fine score field `F` during preparation. `F` is evaluated on the **same retained DFlash candidate IDs**, so regression learns how the target would re-score DFlash's own candidate set.
+During preparation, the frozen LFM2.5 target supplies `F` on the **same retained candidate IDs**.
 
-## 3. Linear residual model
+## 3. Linear residual surrogate
 
-V12 fits a standardized ridge regression model
+V12 deliberately uses ordinary standardized ridge regression rather than another neural decoder.
+
+For feature matrix `X` and target residual `y`:
 
 ```text
-R_beta(x) ~= center(F) - q
+β = (XᵀX + λI)⁻¹ Xᵀy
 ```
 
-with a closed-form least-squares solution:
+with:
 
 ```text
-beta = (X^T X + lambda I)^(-1) X^T y
+y = center(F) - q
 ```
 
-The intercept is not regularized. The default ridge coefficient is `1e-3`.
+The intercept is not regularized. The default ridge coefficient is `0.001`.
 
-This is intentionally small. V12 does not add a Transformer, MLP, recurrent network, or learned decoding head at inference time.
+This gives V12 a compact correction path that can be evaluated as vectorized linear algebra.
 
-## 4. Feature vector
+## 4. Feature contract
 
-For every `(position, candidate)` pair the default feature vector contains eight values:
+Each `(block position, retained candidate)` row receives eight features:
 
 1. current centered candidate score;
 2. original coarse centered candidate score;
-3. normalized rank in the original DFlash top-k list;
+3. normalized rank in the DFlash top-k list;
 4. normalized block position;
-5. original top-1/top-2 DFlash margin at that position;
-6. scaled dot-product similarity between the candidate embedding and the last prefix-token embedding;
-7. scaled dot-product similarity between the candidate embedding and the prefix-mean embedding;
-8. current score multiplied by normalized block position.
+5. coarse top-1/top-2 margin;
+6. candidate-embedding similarity to the last prefix token;
+7. candidate-embedding similarity to the prefix-mean embedding;
+8. current-score × block-position interaction.
 
-All feature rows are standardized using training-set mean and standard deviation. Those statistics are stored in the JSON artifact.
+Feature means and scales are learned from the training examples and stored with the coefficients in the V12 JSON artifact.
 
-The two embedding-similarity features are computed with vectorized indexing/dot products. They provide candidate-specific semantic information without another model forward pass.
+The embedding similarities are vectorized lookup/dot-product features; they do not require another Transformer forward pass.
 
-## 5. Iterative correction
+## 5. Repeated correction
 
-For correction round `k`:
-
-```text
-Delta_k = clip(R_beta(features(q_k, G)), -c, +c)
-q_(k+1) = center(q_k + omega * Delta_k)
-```
-
-where:
-
-- `omega` is the damping factor, default `0.75`;
-- `c` is the residual clip, default `6.0`;
-- default correction rounds = `2`.
-
-Every `(B x K)` feature row is evaluated in one vectorized NumPy operation. There is no dependency on a newly chosen token from another position, so the correction itself remains parallel across the block.
-
-After the final round, V12 chooses the highest corrected score at every block position and passes the complete proposal to the ordinary target verifier.
-
-## 6. Why training includes intermediate states
-
-If regression were trained only on `q_0 = G`, a second correction round would apply the model outside the state distribution seen during fitting. V12 therefore augments each training block with interpolated states:
+The inference update is:
 
 ```text
-q_tau = (1 - tau) * G + tau * F
+Δ_k = clip(R_linear(features(q_k, G)), -c, +c)
+q_(k+1) = center(q_k + ω · Δ_k)
 ```
 
-using default interpolation values:
+where the canonical defaults are:
 
 ```text
-0.00, 0.50, 0.75
+correction rounds R = 2
+damping ω           = 0.75
+residual clip c     = 6.0
 ```
 
-For each state the regression target is:
+All `B × K` rows are evaluated together. There is no dependency on a newly selected token from another block position inside the correction rounds.
+
+After the final correction, V12 selects the highest corrected candidate at every slot and sends the proposal to the ordinary LFM2.5 target verifier.
+
+## 6. Intermediate-state training
+
+A second correction round would be extrapolation if the regressor were trained only at `q₀ = G`. V12 therefore adds interpolated training states:
 
 ```text
-F - q_tau
+q_τ = (1 - τ)G + τF
 ```
 
-This makes repeated residual application a trained behavior rather than an accidental extrapolation.
+with canonical values:
 
-## 7. Teacher-data collection
+```text
+τ = 0.00, 0.50, 0.75
+```
 
-Preparation uses frozen target-model greedy trajectories.
+Each interpolated state uses target residual:
 
-For each training seed:
+```text
+F - q_τ
+```
 
-1. generate a deterministic greedy continuation;
-2. run one full causal target forward on the completed trajectory;
-3. reuse the resulting target logits for every legal block window on that trajectory;
-4. compute the DFlash block logits for each prefix;
+so repeated correction is trained behavior rather than an accidental repeated application.
+
+## 7. LFM2.5 teacher-data preparation
+
+The canonical V12 artifact is prepared from:
+
+```text
+real_benchmarks/train_seeds.json
+```
+
+For each frozen LFM2.5 greedy trajectory:
+
+1. generate the deterministic continuation;
+2. perform one full causal target pass over the completed trajectory;
+3. reuse those causal logits for legal block windows;
+4. compute DFlash coarse block logits for each prefix;
 5. retain DFlash top-k candidate IDs and scores;
-6. index the cached teacher logits at the same candidate IDs;
-7. compute the two embedding-similarity features;
-8. construct coarse/fine regression examples.
+6. index the target logits on the same candidate IDs;
+7. compute embedding-similarity features;
+8. build coarse/fine regression examples;
+9. reserve an internal holdout split;
+10. solve the ridge regression in closed form.
 
-Because causal logits at a position do not depend on later tokens, one completed-trajectory target forward can provide the fine logits for all block windows on that trajectory.
+The resulting artifact is:
+
+```text
+lfm-artifacts/v12_parareal.json
+```
+
+It contains no target-model weights.
 
 ## 8. Convergence diagnostics
 
-V12 records teacher-space score error by round:
+Where teacher `F` is available, V12 records:
 
 ```text
-E_k = mean((center(F) - q_k)^2)
+E_k = mean((center(F) - q_k)²)
 ```
 
 and stores:
@@ -152,22 +168,20 @@ and stores:
 - `contraction_ratio_by_round = E_(k+1) / E_k`;
 - fine top-1 agreement by round.
 
-A straight descending trend in `log(E_k)` is the desired signature of approximately geometric convergence. These values are measured only when `F` is available during preparation/evaluation.
-
-They are **not** used during normal inference.
+A descending approximately linear trend in `log(E_k)` is the desired signature of geometric contraction. These diagnostics are preparation/holdout measurements and are never inference-time oracles.
 
 ## 9. Exactness contract
 
-V12 proposals are approximate. The linear corrector is never authoritative.
+The V12 linear corrector is never authoritative.
 
-The target verifier:
+The LFM2.5 target verifier:
 
 1. evaluates the proposed block;
 2. accepts only the matching prefix;
-3. inserts the target's first mismatching greedy token;
+3. supplies the first mismatching greedy token;
 4. continues until the requested output length is reached.
 
-Every benchmark row includes an exact comparison with normal target-only greedy decoding. A V12 configuration is not considered valid if this comparison fails.
+The unified benchmark then compares the complete output with normal target-only greedy decoding. V12 is valid only when `all_exact == true`.
 
 ## 10. Complexity
 
@@ -175,111 +189,87 @@ Let:
 
 - `B` = speculative block length;
 - `K` = retained candidates per position;
-- `D` = linear feature count (`8` by default);
+- `D` = feature count (`8`);
 - `R` = correction rounds (`2` by default);
 - `H` = target embedding width.
 
-The affine residual work is approximately:
+Affine correction work is approximately:
 
 ```text
-O(R * B * K * D)
+O(R · B · K · D)
 ```
 
-The two semantic similarity features add vectorized embedding dot products of approximately:
+Embedding similarity work is approximately:
 
 ```text
-O(B * K * H)
+O(B · K · H)
 ```
 
-No additional target or neural drafter forward pass is introduced by the V12 correction itself.
+V12 adds no target forward pass and no neural correction forward pass. End-to-end speed must still be measured because memory traffic, feature construction, drafter cost, and target verification dominate practical runtime behavior.
 
-This complexity statement concerns only V12 guidance/correction. End-to-end latency is still dominated by target/drafter inference and memory behavior.
-
-## 11. Artifact format
-
-The default artifact is a small JSON file:
-
-```text
-lfm-artifacts/v12_parareal.json
-```
-
-It stores:
-
-- format version and algorithm name;
-- feature contract;
-- regression coefficients;
-- feature normalization statistics;
-- model ID and block/candidate metadata;
-- training configuration;
-- training and holdout convergence diagnostics.
-
-Target weights are not embedded or redistributed in this artifact.
-
-## 12. Commands
-
-Prepare the regression model:
+## 11. Prepare V12
 
 ```bash
 python -m dflash_mini_lab.v12_prepare \
   --aux lfm-artifacts/lfm_aux.pt \
-  --seeds real_benchmarks/train_seeds.json \
   --output lfm-artifacts/v12_parareal.json \
+  --seeds real_benchmarks/train_seeds.json \
+  --max-seed-count 24 \
+  --generation-tokens 24 \
   --top-k 8 \
   --correction-rounds 2 \
   --damping 0.75 \
-  --ridge 0.001
+  --ridge 0.001 \
+  --holdout-fraction 0.20 \
+  --cpu-threads 2
 ```
 
-Benchmark it:
+## 12. Evaluate V12 with all other methods
+
+V12 is not published from a separate synthetic/unit benchmark. It is measured in the same real-model run as the other eleven speculative methods:
 
 ```bash
-python -m dflash_mini_lab.v12_benchmark \
+python -m dflash_mini_lab.lfm_all12_benchmark \
   --aux lfm-artifacts/lfm_aux.pt \
   --dspark lfm-artifacts/lfm_dspark.pt \
   --v12-model lfm-artifacts/v12_parareal.json \
-  --prompts real_benchmarks/test_prompts.json \
-  --output-dir v12-reports
+  --prompts real_benchmarks/prompts.json \
+  --calibration-prompts real_benchmarks/calibration_prompts.json \
+  --output-dir lfm-reports \
+  --tokens 24 \
+  --repeats 3 \
+  --prompt-limit 6 \
+  --top-k 8 \
+  --cpu-threads 2
 ```
 
-Run unit tests:
+The report page then shows V12 beside DFlash through V11 using the same LFM2.5 target, prompts, CPU protocol, exactness check, and aggregation rule.
 
-```bash
-pytest -q
-```
-
-## 13. Research claims that are currently justified
+## 13. Claims supported by the implementation
 
 The implementation supports these mechanism-level statements:
 
 - a DFlash top-k block can be treated as a coarse continuous score field;
-- a fine-minus-coarse residual can be learned with ordinary linear regression;
-- the residual can be applied to all retained candidates in parallel;
-- repeated correction can be trained using intermediate coarse/fine states;
-- teacher-space log-error convergence can be measured explicitly;
-- exact greedy decoding is preserved by target verification.
+- a fine-minus-current residual can be approximated with ordinary linear regression;
+- the residual can be applied to every retained candidate in parallel;
+- intermediate coarse/fine states can train repeated correction;
+- teacher-space log-error contraction can be measured explicitly;
+- exact greedy output is preserved by authoritative target verification when the exactness gate passes.
 
-## 14. Claims that require real benchmark evidence
+## 14. Claims requiring measured LFM2.5 evidence
 
-Do **not** claim any of the following until the corresponding measured V12 report supports it:
+Do not claim any of the following unless the generated all-12 `benchmark.json` supports it:
 
 - V12 is faster than normal greedy decoding;
-- V12 is faster than DFlash or V11;
-- V12 improves acceptance on arbitrary prompts;
-- V12 converges geometrically on real-model holdout data;
-- V12 generalizes across models or candidate vocabularies;
-- V12 is equivalent to classical Parareal.
+- V12 is faster than another speculative method;
+- V12 improves acceptance;
+- V12 has geometric contraction on real holdout data;
+- fewer target calls translate to better wall-clock throughput.
 
-The synthetic convergence unit test validates the numerical mechanism only.
-
-## 15. Recommended next experiments
-
-1. Run the default LFM holdout preparation and inspect `log_teacher_mse_by_round`.
-2. Compare one, two, and three correction rounds.
-3. Sweep damping over a bounded set such as `0.50, 0.75, 1.00`.
-4. Measure correction time separately from drafter and verifier time.
-5. Compare V12 against plain DFlash and V11 on the same prompt order and exactness reference.
-6. If the linear residual consistently contracts teacher error, port the artifact/selector interface to the cached Qwen path.
+The repository intentionally preserves negative results.
 
 ## Reference inspiration
 
-V12 is motivated by the coarse/fine correction principle described in the Parareal literature, including the work titled **“Parareal Contribution to Speeding-Up the Solving of Nonlinear Ordinary Differential Equations on Parallel/Multi-Core Platforms for Sensing Systems.”** The adaptation here operates on speculative logit fields and uses a learned linear surrogate for the fine-minus-coarse residual.
+V12 is motivated by the coarse/fine correction principle described in the Parareal literature, including **“Parareal Contribution to Speeding-Up the Solving of Nonlinear Ordinary Differential Equations on Parallel/Multi-Core Platforms for Sensing Systems.”** The adaptation here operates on speculative score fields and uses a learned linear surrogate for the fine-minus-current residual.
+
+See [`algorithm.md`](algorithm.md) for the complete 12-method comparison and [`reproducibility.md`](reproducibility.md) for the one-model benchmark protocol.
