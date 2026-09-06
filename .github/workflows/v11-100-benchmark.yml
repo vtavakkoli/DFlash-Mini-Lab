@@ -1,0 +1,256 @@
+name: V11 100-prompt LFM validation
+
+on:
+  pull_request:
+    paths:
+      - "real_benchmarks/prompts_100.json"
+      - "src/dflash_mini_lab/v11_100_benchmark.py"
+      - ".github/workflows/v11-100-benchmark.yml"
+  push:
+    branches: [main]
+    paths:
+      - "real_benchmarks/prompts_100.json"
+      - "src/dflash_mini_lab/v11_100_benchmark.py"
+      - ".github/workflows/v11-100-benchmark.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: "v11-100-${{ github.ref }}"
+  cancel-in-progress: true
+
+jobs:
+  v11-100-lfm-cpu:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Restore Hugging Face model cache
+        uses: actions/cache@v4
+        with:
+          path: hf-cache
+          key: lfm25-350m-base-${{ runner.os }}-transformers5161-v1
+
+      - name: Build and compile validation image
+        run: |
+          docker build -f Dockerfile.lfm -t dflash-v11-100 .
+          docker run --rm dflash-v11-100 python -m py_compile \
+            /app/src/dflash_mini_lab/v11_100_benchmark.py \
+            /app/src/dflash_mini_lab/v11_benchmark.py \
+            /app/src/dflash_mini_lab/v11_boltzmann_mobs.py \
+            /app/src/dflash_mini_lab/lfm_v9v10_benchmark.py
+
+      - name: Prepare frozen DFlash auxiliaries
+        run: |
+          mkdir -p hf-cache lfm-artifacts
+          docker run --rm \
+            -e HF_HOME=/cache \
+            -e CPU_THREADS=2 \
+            -e OMP_NUM_THREADS=2 \
+            -e MKL_NUM_THREADS=2 \
+            -e OPENBLAS_NUM_THREADS=2 \
+            -v "$PWD/hf-cache:/cache" \
+            -v "$PWD/lfm-artifacts:/app/lfm-artifacts" \
+            dflash-v11-100 \
+            python -m dflash_mini_lab.lfm_prepare \
+              --model-id LiquidAI/LFM2.5-350M-Base \
+              --output-dir /app/lfm-artifacts \
+              --max-seed-count 40 \
+              --generation-tokens 32 \
+              --top-candidate-k 32 \
+              --candidate-limit 2048 \
+              --drafter-steps 300 \
+              --selector-steps 180 \
+              --jump-steps 120 \
+              --fused-steps 180 \
+              --cpu-threads 2
+
+      - name: Reproduce frozen V9 DSpark heads
+        run: |
+          docker run --rm \
+            -e HF_HOME=/cache \
+            -e TRANSFORMERS_OFFLINE=1 \
+            -e HF_HUB_OFFLINE=1 \
+            -e CPU_THREADS=2 \
+            -e OMP_NUM_THREADS=2 \
+            -e MKL_NUM_THREADS=2 \
+            -e OPENBLAS_NUM_THREADS=2 \
+            -v "$PWD/hf-cache:/cache" \
+            -v "$PWD/lfm-artifacts:/app/lfm-artifacts" \
+            dflash-v11-100 \
+            python -m dflash_mini_lab.lfm_dspark \
+              --aux /app/lfm-artifacts/lfm_aux.pt \
+              --output /app/lfm-artifacts/lfm_dspark.pt \
+              --seeds /app/real_benchmarks/train_seeds.json \
+              --max-seed-count 40 \
+              --generation-tokens 32 \
+              --markov-rank 16 \
+              --markov-steps 180 \
+              --confidence-steps 100 \
+              --batch-size 64 \
+              --cpu-threads 2
+
+      - name: Run frozen 100-prompt contender benchmark
+        run: |
+          mkdir -p v11-100-reports
+          docker run --rm \
+            -e HF_HOME=/cache \
+            -e TRANSFORMERS_OFFLINE=1 \
+            -e HF_HUB_OFFLINE=1 \
+            -e CPU_THREADS=2 \
+            -e OMP_NUM_THREADS=2 \
+            -e MKL_NUM_THREADS=2 \
+            -e OPENBLAS_NUM_THREADS=2 \
+            -v "$PWD/hf-cache:/cache" \
+            -v "$PWD/lfm-artifacts:/app/lfm-artifacts:ro" \
+            -v "$PWD/v11-100-reports:/app/v11-100-reports" \
+            dflash-v11-100 \
+            python -m dflash_mini_lab.v11_100_benchmark \
+              --aux /app/lfm-artifacts/lfm_aux.pt \
+              --dspark /app/lfm-artifacts/lfm_dspark.pt \
+              --prompts /app/real_benchmarks/prompts_100.json \
+              --output-dir /app/v11-100-reports \
+              --tokens 24 \
+              --prompt-limit 100 \
+              --top-k 8 \
+              --cpu-threads 2 \
+              --dtype float32
+
+      - name: Upload 100-prompt diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lfm25-350m-v11-100prompt-validation
+          path: |
+            v11-100-reports/
+            lfm-artifacts/manifest.json
+            lfm-artifacts/distillation.json
+            lfm-artifacts/lfm_aux.pt
+            lfm-artifacts/lfm_dspark.pt
+          retention-days: 30
+
+      - name: Validate 100-prompt exactness and statistics
+        run: |
+          test -s v11-100-reports/benchmark.json
+          test -s v11-100-reports/report.html
+          grep -q "100-prompt validation" v11-100-reports/report.html
+          python - <<'PY'
+          import json, math
+          d=json.load(open('v11-100-reports/benchmark.json'))
+          assert d['model']['id'] == 'LiquidAI/LFM2.5-350M-Base'
+          assert d['config']['prompt_count'] == 100
+          assert d['config']['tokens_per_prompt'] == 24
+          assert d['config']['repeats'] == 1
+          assert d['evaluation_set']['unique_prompt_count'] == 100
+          assert d['evaluation_set']['held_out_from_training']
+          assert d['evaluation_set']['held_out_from_calibration']
+          expected=(
+              'normal','dflash','dflash3_mobs','dflash6_boltzmann',
+              'dspark_v9','boltzmann_v10','boltzmann_gated_mobs_v11'
+          )
+          assert set(d['summary']) == set(expected)
+          for name in expected:
+              s=d['summary'][name]
+              assert s['all_exact'], name
+              assert s['aggregate_tokens_per_second'] > 0, name
+              assert s['speedup_vs_normal'] > 0, name
+              assert s['speedup_vs_dflash'] > 0, name
+              for key in ('speedup_vs_normal_ci95','speedup_vs_dflash_ci95'):
+                  lo,hi=s[key]
+                  assert math.isfinite(lo) and math.isfinite(hi) and 0 < lo <= hi, (name,key,lo,hi)
+          assert d['summary']['boltzmann_gated_mobs_v11']['mean_total_guidance_scores'] < d['summary']['dflash3_mobs']['mean_total_guidance_scores']
+          assert d['winner'] in expected and d['runner_up'] in expected
+          lo=d['winner_vs_runner_up']['ci95_low']; hi=d['winner_vs_runner_up']['ci95_high']
+          assert math.isfinite(lo) and math.isfinite(hi) and 0 < lo <= hi
+          print(json.dumps({
+              'winner':d['winner'],
+              'runner_up':d['runner_up'],
+              'clear_winner_95pct':d['clear_winner_95pct'],
+              'winner_vs_runner_up':d['winner_vs_runner_up'],
+              'summary':d['summary'],
+          }, indent=2))
+          PY
+
+      - name: Write 100-prompt benchmark summary
+        run: |
+          python - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json
+          d=json.load(open('v11-100-reports/benchmark.json'))
+          print('# LFM2.5-350M · 100-prompt frozen-setting validation')
+          print(f"Winner: **{d['winner']}**")
+          print(f"Runner-up: **{d['runner_up']}**")
+          w=d['winner_vs_runner_up']
+          print(f"Winner vs runner-up: **{w['point']:.4f}x**, paired-bootstrap 95% CI **[{w['ci95_low']:.4f}, {w['ci95_high']:.4f}]**")
+          print(f"Statistically clear at 95%: **{d['clear_winner_95pct']}**")
+          print('| Method | aggregate tok/s | vs normal | vs DFlash | 95% CI vs DFlash | acceptance | guidance ops | exact |')
+          print('|---|---:|---:|---:|---:|---:|---:|:---:|')
+          for name,s in sorted(d['summary'].items(), key=lambda kv: kv[1]['aggregate_tokens_per_second'], reverse=True):
+              lo,hi=s['speedup_vs_dflash_ci95']
+              print(f"| {name} | {s['aggregate_tokens_per_second']:.3f} | {s['speedup_vs_normal']:.3f}x | {s['speedup_vs_dflash']:.3f}x | [{lo:.3f},{hi:.3f}] | {100*s['mean_acceptance_rate']:.1f}% | {s['mean_total_guidance_scores']:.1f} | {'yes' if s['all_exact'] else 'NO'} |")
+          PY
+
+      - name: Prepare 100-prompt Pages site
+        if: github.event_name != 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          rm -rf pages /tmp/v11old /tmp/v10 /tmp/eagle /tmp/q17 /tmp/q06 /tmp/tiny
+          mkdir -p pages/v11-100
+          cp v11-100-reports/report.html pages/index.html
+          cp v11-100-reports/report.html pages/v11-100/index.html
+          cp v11-100-reports/benchmark.json pages/v11-100/benchmark.json
+
+          fetch_artifact () {
+            name="$1"; dest="$2"; zip="$3"
+            id=$(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts?name=$name&per_page=20" --jq '.artifacts | map(select(.expired==false)) | .[0].id // empty')
+            if [ -n "$id" ]; then mkdir -p "$dest"; gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$id/zip" > "$zip"; unzip -q "$zip" -d "$dest"; fi
+          }
+          fetch_artifact lfm25-350m-v11-boltzmann-gated-mobs /tmp/v11old /tmp/v11old.zip || true
+          fetch_artifact lfm25-350m-v9-v10-showcase /tmp/v10 /tmp/v10.zip || true
+          fetch_artifact eagle3-v8-qwen3-17b-benchmark /tmp/eagle /tmp/eagle.zip || true
+          fetch_artifact qwen3-17b-all-methods-benchmark /tmp/q17 /tmp/q17.zip || true
+          fetch_artifact qwen3-06b-dflash7-benchmark /tmp/q06 /tmp/q06.zip || true
+          fetch_artifact dflash-cpu-report /tmp/tiny /tmp/tiny.zip || true
+
+          if [ -s /tmp/v11old/v11-reports/report.html ]; then mkdir -p pages/v11; cp /tmp/v11old/v11-reports/report.html pages/v11/index.html; cp /tmp/v11old/v11-reports/benchmark.json pages/v11/benchmark.json; fi
+          if [ -s /tmp/v10/lfm-reports/report.html ]; then mkdir -p pages/lfm-v10; cp /tmp/v10/lfm-reports/report.html pages/lfm-v10/index.html; cp /tmp/v10/lfm-reports/benchmark.json pages/lfm-v10/benchmark.json; fi
+          if [ -s /tmp/eagle/report.html ]; then mkdir -p pages/eagle3; cp /tmp/eagle/report.html pages/eagle3/index.html; cp /tmp/eagle/benchmark.json pages/eagle3/benchmark.json; fi
+          if [ -s /tmp/q17/qwen17-reports/report.html ]; then mkdir -p pages/qwen17; cp -r /tmp/q17/qwen17-reports/* pages/qwen17/; fi
+          if [ -s /tmp/q06/qwen-reports/report.html ]; then mkdir -p pages/qwen06; cp -r /tmp/q06/qwen-reports/* pages/qwen06/; fi
+          if [ -s /tmp/tiny/report.html ]; then mkdir -p pages/tiny; cp -r /tmp/tiny/* pages/tiny/; fi
+
+          python - <<'PY'
+          from pathlib import Path
+          p=Path('pages/index.html'); s=p.read_text()
+          nav="""<div style='position:sticky;top:8px;z-index:30;max-width:1180px;margin:8px auto;padding:8px 16px;border:1px solid #294963;border-radius:14px;background:#07111fee;backdrop-filter:blur(12px);font-family:system-ui'><b>100-prompt LFM validation</b> · <a style='color:#58d9ff' href='./v11-100/'>100 prompts</a> · <a style='color:#58d9ff' href='./v11/'>V11 6-prompt</a> · <a style='color:#58d9ff' href='./lfm-v10/'>V9/V10</a> · <a style='color:#58d9ff' href='./qwen17/'>Qwen1.7B</a> · <a style='color:#58d9ff' href='./eagle3/'>EAGLE3</a> · <a style='color:#58d9ff' href='./qwen06/'>Qwen0.6B</a> · <a style='color:#58d9ff' href='./tiny/'>Tiny</a></div>"""
+          p.write_text(s.replace('<body>', '<body>'+nav, 1)); Path('pages/.nojekyll').touch()
+          PY
+
+      - name: Upload GitHub Pages artifact
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: pages
+
+  deploy-pages:
+    if: github.event_name != 'pull_request'
+    needs: v11-100-lfm-cpu
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      pages: write
+      id-token: write
+      actions: read
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy 100-prompt benchmark site
+        id: deployment
+        uses: actions/deploy-pages@v4
