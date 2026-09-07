@@ -2,7 +2,7 @@
 
 A reproducible **LFM2.5 speculative-decoding research lab** centered on one target: `LiquidAI/LFM2.5-350M-Base`.
 
-The canonical published study compares **14 speculative mechanisms** plus normal greedy decoding on CPU. A separate Docker Compose GPU path runs the same All-14 method logic with the LFM target and DFlash drafter on CUDA.
+The canonical published study compares **14 speculative mechanisms** plus normal greedy decoding on CPU. A separate GPU path runs the same All-14 method logic with the LFM target and DFlash drafter on CUDA.
 
 > [!IMPORTANT]
 > DFlash3 through DFlash14 are experimental DFlash Mini Lab variants and are not upstream official DFlash releases.
@@ -13,18 +13,96 @@ The canonical published study compares **14 speculative mechanisms** plus normal
 
 The GitHub Pages site is generated from the unified LFM2.5 CPU workflow and reports speedup, tokens/second, acceptance, target-forward count, tokens/target-call, selector/correction work, exactness, and an animated mechanism explorer. The machine-readable source of truth is `benchmark.json`.
 
+## Direct GPU test — no repository install
+
+From a fresh clone, run:
+
+```bash
+python run_gpu.py
+```
+
+You do **not** need:
+
+```text
+pip install -e .
+pip install .
+```
+
+`run_gpu.py` adds the repository `src/` directory to Python's import path itself. On the first run it also:
+
+1. downloads the prepared artifacts **directly as individual GitHub Release assets**;
+2. verifies each file against `artifact-manifest.json` using SHA-256 and file size;
+3. installs only missing runtime dependencies when necessary (the repository itself is never installed);
+4. checks that CUDA is really usable with an FP16 matrix multiplication;
+5. runs the exactness-gated LFM2.5 All-14 GPU benchmark.
+
+Prepared files are cached in:
+
+```text
+gpu-artifacts/lfm_aux.pt
+gpu-artifacts/lfm_dspark.pt
+gpu-artifacts/v12_parareal.json
+gpu-artifacts/v14_simple_parareal.json
+gpu-artifacts/artifact-manifest.json
+```
+
+The stable artifact release is:
+
+```text
+lfm25-all14-artifacts-v1
+```
+
+### Quick GPU smoke test
+
+```bash
+python run_gpu.py --smoke
+```
+
+This uses 1 prompt, 8 generated tokens and 1 repeat.
+
+### Download the `.pt` files only
+
+```bash
+python run_gpu.py --download-only
+```
+
+### Download artifacts and check CUDA only
+
+```bash
+python run_gpu.py --check-only
+```
+
+### Full benchmark settings
+
+```bash
+python run_gpu.py \
+  --tokens 24 \
+  --repeats 3 \
+  --prompt-limit 6 \
+  --dtype float16
+```
+
+On Windows PowerShell the simplest command is still just:
+
+```powershell
+python .\run_gpu.py
+```
+
+No PowerShell line continuation is required unless you override options.
+
+Outputs:
+
+```text
+gpu-reports/index.html
+gpu-reports/report.html
+gpu-reports/benchmark.json
+```
+
+The target model weights are still loaded from the official `LiquidAI/LFM2.5-350M-Base` Hugging Face source. The downloaded GitHub Release assets contain only the frozen DFlash/DSpark/Parareal auxiliary artifacts used by this lab.
+
 ## GPU test with Docker Compose
 
-The repository now includes a CUDA-enabled local benchmark path.
-
-### Prerequisites
-
-- NVIDIA GPU + recent NVIDIA driver;
-- Docker;
-- NVIDIA Container Toolkit configured for Docker;
-- Docker Compose v2 with GPU support.
-
-### Run the full GPU benchmark
+Docker uses the same direct runner and the same published artifacts:
 
 ```bash
 docker compose --profile gpu run --rm test-gpu
@@ -36,28 +114,20 @@ Legacy Compose syntax, when installed:
 docker-compose --profile gpu run --rm test-gpu
 ```
 
-The service does **not** silently fall back to CPU. It first checks:
+The service does **not** silently fall back to CPU. It checks:
 
 - `torch.cuda.is_available()`;
 - detected GPU(s), memory and compute capability;
 - PyTorch/CUDA/cuDNN versions;
 - a real FP16 matrix multiplication on CUDA.
 
-If the check passes, the service prepares any missing LFM2.5 artifacts and runs Normal + all 14 speculative methods with exact greedy verification.
+The Docker image also does **not** install the DFlash Mini Lab package. It imports directly from `/app/src` through `run_gpu.py` and downloads missing prepared artifacts into the persistent artifact volume.
 
-### Quick smoke test
+### Quick Docker smoke test
 
 ```bash
 GPU_PROMPT_LIMIT=1 GPU_REPEATS=1 GPU_TOKENS=8 \
   docker compose --profile gpu run --rm test-gpu
-```
-
-### GPU outputs
-
-```text
-gpu-reports/index.html
-gpu-reports/report.html
-gpu-reports/benchmark.json
 ```
 
 Artifacts are persisted in:
@@ -222,10 +292,11 @@ See [`docs/reproducibility.md`](docs/reproducibility.md).
 ## Repository layout
 
 ```text
+run_gpu.py                                  zero-install direct GPU runner + verified artifact downloader
 Dockerfile.lfm                              canonical CPU image
-Dockerfile.gpu                              CUDA 12.8 PyTorch image
+Dockerfile.gpu                              CUDA 12.8 PyTorch image without repository package install
 docker-compose.yml                          benchmark + test-gpu services
-scripts/test_gpu.sh                         one-command GPU check/prep/benchmark
+scripts/test_gpu.sh                         Docker wrapper around run_gpu.py
 src/dflash_mini_lab/lfm_runtime.py          CPU LFM2.5 reference runtime
 src/dflash_mini_lab/lfm_gpu_runtime.py      CUDA target + DFlash drafter runtime
 src/dflash_mini_lab/lfm_gpu_check.py        CUDA capability/matmul verification
@@ -235,6 +306,7 @@ src/dflash_mini_lab/v13_minop.py            V13 MinOp
 src/dflash_mini_lab/v14_simple_parareal.py  V14 scalar Parareal
 docs/gpu.md                                 GPU protocol
 .github/workflows/lfm-real-benchmark.yml     canonical CPU evidence workflow
+.github/workflows/publish-artifacts.yml      persistent prepared-artifact Release publisher
 ```
 
 ## References
