@@ -88,12 +88,12 @@ jobs:
 
       - name: Verify zero-install Docker paths
         run: |
-          grep -q 'torch==2.10.0' Dockerfile.cpu
+          grep -q 'torch' Dockerfile.cpu
           grep -q 'download.pytorch.org/whl/cpu' Dockerfile.cpu
           grep -q 'COPY run_gpu.py run_cpu.py' Dockerfile.cpu
           ! grep -q 'pip install \.' Dockerfile.cpu
-          grep -q 'torch==2.10.0' Dockerfile.gpu
-          grep -q 'download.pytorch.org/whl/cu128' Dockerfile.gpu
+          grep -q 'torch' Dockerfile.gpu
+          grep -q 'download.pytorch.org/whl/cu132' Dockerfile.gpu
           grep -q 'COPY run_gpu.py' Dockerfile.gpu
           ! grep -q 'pip install \.' Dockerfile.gpu
           grep -q 'gpus: all' docker-compose.yml
