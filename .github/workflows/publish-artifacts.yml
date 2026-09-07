@@ -1,0 +1,175 @@
+name: Publish LFM2.5 prepared artifacts
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/publish-artifacts.yml"
+      - "Dockerfile.lfm"
+      - "real_benchmarks/train_seeds.json"
+      - "src/dflash_mini_lab/lfm_aux.py"
+      - "src/dflash_mini_lab/lfm_prepare.py"
+      - "src/dflash_mini_lab/lfm_dspark.py"
+      - "src/dflash_mini_lab/v12_parareal.py"
+      - "src/dflash_mini_lab/v12_prepare.py"
+      - "src/dflash_mini_lab/v14_simple_parareal.py"
+      - "src/dflash_mini_lab/v14_prepare.py"
+      - "pyproject.toml"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publish-lfm25-all14-artifacts
+  cancel-in-progress: true
+
+env:
+  RELEASE_TAG: lfm25-all14-artifacts-v1
+
+jobs:
+  build-and-publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 210
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Restore LFM2.5 Hugging Face cache
+        uses: actions/cache@v4
+        with:
+          path: hf-cache
+          key: lfm25-350m-base-${{ runner.os }}-transformers5161-v1
+
+      - name: Build canonical CPU preparation image
+        run: docker build -f Dockerfile.lfm -t dflash-lfm25 .
+
+      - name: Prepare frozen DFlash backbone
+        run: |
+          mkdir -p hf-cache release-artifacts
+          docker run --rm \
+            -e HF_HOME=/cache \
+            -e CPU_THREADS=2 -e OMP_NUM_THREADS=2 -e MKL_NUM_THREADS=2 -e OPENBLAS_NUM_THREADS=2 \
+            -v "$PWD/hf-cache:/cache" \
+            -v "$PWD/release-artifacts:/app/lfm-artifacts" \
+            dflash-lfm25 \
+            python -m dflash_mini_lab.lfm_prepare \
+              --model-id LiquidAI/LFM2.5-350M-Base \
+              --output-dir /app/lfm-artifacts \
+              --max-seed-count 40 --generation-tokens 32 \
+              --top-candidate-k 32 --candidate-limit 2048 \
+              --drafter-steps 300 --selector-steps 180 \
+              --jump-steps 120 --fused-steps 180 --cpu-threads 2
+
+      - name: Prepare V9 DSpark-Lite heads
+        run: |
+          docker run --rm \
+            -e HF_HOME=/cache -e TRANSFORMERS_OFFLINE=1 -e HF_HUB_OFFLINE=1 \
+            -e CPU_THREADS=2 -e OMP_NUM_THREADS=2 -e MKL_NUM_THREADS=2 -e OPENBLAS_NUM_THREADS=2 \
+            -v "$PWD/hf-cache:/cache" \
+            -v "$PWD/release-artifacts:/app/lfm-artifacts" \
+            dflash-lfm25 \
+            python -m dflash_mini_lab.lfm_dspark \
+              --aux /app/lfm-artifacts/lfm_aux.pt \
+              --output /app/lfm-artifacts/lfm_dspark.pt \
+              --seeds /app/real_benchmarks/train_seeds.json \
+              --max-seed-count 40 --generation-tokens 32 \
+              --markov-rank 16 --markov-steps 180 \
+              --confidence-steps 100 --batch-size 64 --cpu-threads 2
+
+      - name: Prepare V12 PARAREAL model
+        run: |
+          docker run --rm \
+            -e HF_HOME=/cache -e TRANSFORMERS_OFFLINE=1 -e HF_HUB_OFFLINE=1 \
+            -e CPU_THREADS=2 -e OMP_NUM_THREADS=2 -e MKL_NUM_THREADS=2 -e OPENBLAS_NUM_THREADS=2 \
+            -v "$PWD/hf-cache:/cache" \
+            -v "$PWD/release-artifacts:/app/lfm-artifacts" \
+            dflash-lfm25 \
+            python -m dflash_mini_lab.v12_prepare \
+              --aux /app/lfm-artifacts/lfm_aux.pt \
+              --output /app/lfm-artifacts/v12_parareal.json \
+              --seeds /app/real_benchmarks/train_seeds.json \
+              --max-seed-count 24 --generation-tokens 24 \
+              --top-k 8 --correction-rounds 2 --damping 0.75 \
+              --holdout-fraction 0.20 --cpu-threads 2
+
+      - name: Prepare V14 Simple PARAREAL estimator
+        run: |
+          docker run --rm \
+            -e HF_HOME=/cache -e TRANSFORMERS_OFFLINE=1 -e HF_HUB_OFFLINE=1 \
+            -e CPU_THREADS=2 -e OMP_NUM_THREADS=2 -e MKL_NUM_THREADS=2 -e OPENBLAS_NUM_THREADS=2 \
+            -v "$PWD/hf-cache:/cache" \
+            -v "$PWD/release-artifacts:/app/lfm-artifacts" \
+            dflash-lfm25 \
+            python -m dflash_mini_lab.v14_prepare \
+              --aux /app/lfm-artifacts/lfm_aux.pt \
+              --output /app/lfm-artifacts/v14_simple_parareal.json \
+              --seeds /app/real_benchmarks/train_seeds.json \
+              --max-seed-count 24 --generation-tokens 24 \
+              --ridge 0.001 --damping 1.0 --switch-threshold 0.0 \
+              --max-corrections 1 --holdout-fraction 0.20 --cpu-threads 2
+
+      - name: Build checksum manifest
+        run: |
+          python - <<'PY'
+          import hashlib, json, os
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          root = Path('release-artifacts')
+          names = (
+              'lfm_aux.pt',
+              'lfm_dspark.pt',
+              'v12_parareal.json',
+              'v14_simple_parareal.json',
+          )
+          files = {}
+          for name in names:
+              path = root / name
+              if not path.is_file() or path.stat().st_size == 0:
+                  raise SystemExit(f'missing prepared artifact: {path}')
+              h = hashlib.sha256()
+              with path.open('rb') as f:
+                  for chunk in iter(lambda: f.read(1024 * 1024), b''):
+                      h.update(chunk)
+              files[name] = {
+                  'sha256': h.hexdigest(),
+                  'size_bytes': path.stat().st_size,
+              }
+          payload = {
+              'format_version': 1,
+              'release_tag': os.environ['RELEASE_TAG'],
+              'model_id': 'LiquidAI/LFM2.5-350M-Base',
+              'source_sha': os.environ['GITHUB_SHA'],
+              'created_utc': datetime.now(timezone.utc).isoformat(),
+              'files': files,
+          }
+          (root / 'artifact-manifest.json').write_text(
+              json.dumps(payload, indent=2, sort_keys=True) + '\n', encoding='utf-8'
+          )
+          print(json.dumps(payload, indent=2))
+          PY
+
+      - name: Create or update persistent artifact release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release create "$RELEASE_TAG" \
+              --target "$GITHUB_SHA" \
+              --title "LFM2.5 All-14 prepared artifacts v1" \
+              --notes "Prepared DFlash Mini Lab auxiliary artifacts for LiquidAI/LFM2.5-350M-Base. These are frozen auxiliary/estimator artifacts; target model weights remain sourced from LiquidAI on Hugging Face. Each asset is checksum-gated by artifact-manifest.json."
+          fi
+          gh release upload "$RELEASE_TAG" \
+            release-artifacts/lfm_aux.pt \
+            release-artifacts/lfm_dspark.pt \
+            release-artifacts/v12_parareal.json \
+            release-artifacts/v14_simple_parareal.json \
+            release-artifacts/artifact-manifest.json \
+            --clobber
+
+      - name: Upload build copy for workflow traceability
+        uses: actions/upload-artifact@v4
+        with:
+          name: lfm25-all14-prepared-artifacts
+          path: release-artifacts/
+          retention-days: 30
