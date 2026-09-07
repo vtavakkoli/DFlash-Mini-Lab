@@ -16,8 +16,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /app
 
 RUN python -m pip install --upgrade pip \
- && python -m pip install torch==2.10.0 --index-url https://download.pytorch.org/whl/cu128 \
- && python -m pip install numpy==2.3.5 transformers==5.16.1
+ && python -m pip install install torch torchvision --index-url https://download.pytorch.org/whl/cu132 \
+ && python -m pip install numpy transformers
 
 COPY src ./src
 COPY real_benchmarks ./real_benchmarks
