@@ -88,14 +88,20 @@ jobs:
 
       - name: Verify zero-install Docker paths
         run: |
-          grep -q 'torch torchvision' Dockerfile.cpu
-          grep -q 'download.pytorch.org/whl/cpu' Dockerfile.cpu
-          grep -q 'COPY run_gpu.py run_cpu.py' Dockerfile.cpu
+          # Keep the known-working Dockerfile installation style. Do not require
+          # version pins or a dedicated CPU wheel index for the CPU image.
+          grep -Fq 'python -m pip install torch torchvision' Dockerfile.cpu
+          grep -Fq 'python -m pip install numpy transformers' Dockerfile.cpu
+          grep -Fq 'COPY run_gpu.py run_cpu.py ./' Dockerfile.cpu
           ! grep -q 'pip install \.' Dockerfile.cpu
-          grep -q 'torch torchvision' Dockerfile.gpu
-          grep -q 'download.pytorch.org/whl/cu132' Dockerfile.gpu
-          grep -q 'COPY run_gpu.py' Dockerfile.gpu
+
+          # GPU keeps the same style but must use the CUDA 13.2 wheel index.
+          grep -Fq 'python -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cu132' Dockerfile.gpu
+          grep -Fq 'python -m pip install numpy transformers' Dockerfile.gpu
+          grep -Fq 'COPY run_gpu.py ./run_gpu.py' Dockerfile.gpu
+          ! grep -Fq 'pip install install' Dockerfile.gpu
           ! grep -q 'pip install \.' Dockerfile.gpu
+
           grep -q 'gpus: all' docker-compose.yml
           grep -q 'test-cpu:' docker-compose.yml
           grep -q 'test-gpu:' docker-compose.yml
