@@ -1,4 +1,4 @@
-name: LFM2.5 All-12 CPU benchmark
+name: LFM2.5 All-14 CPU benchmark
 
 on:
   pull_request:
@@ -8,6 +8,8 @@ on:
       - "src/dflash_mini_lab/lfm_*.py"
       - "src/dflash_mini_lab/v11_*.py"
       - "src/dflash_mini_lab/v12_*.py"
+      - "src/dflash_mini_lab/v13_*.py"
+      - "src/dflash_mini_lab/v14_*.py"
       - ".github/workflows/lfm-real-benchmark.yml"
       - "pyproject.toml"
       - "README.md"
@@ -20,6 +22,8 @@ on:
       - "src/dflash_mini_lab/lfm_*.py"
       - "src/dflash_mini_lab/v11_*.py"
       - "src/dflash_mini_lab/v12_*.py"
+      - "src/dflash_mini_lab/v13_*.py"
+      - "src/dflash_mini_lab/v14_*.py"
       - ".github/workflows/lfm-real-benchmark.yml"
       - "pyproject.toml"
       - "README.md"
@@ -32,13 +36,13 @@ permissions:
   id-token: write
 
 concurrency:
-  group: "lfm25-all12-${{ github.ref }}"
+  group: "lfm25-all14-${{ github.ref }}"
   cancel-in-progress: true
 
 jobs:
-  lfm25-all12:
+  lfm25-all14:
     runs-on: ubuntu-latest
-    timeout-minutes: 180
+    timeout-minutes: 210
     steps:
       - uses: actions/checkout@v6
 
@@ -53,6 +57,7 @@ jobs:
           docker build -f Dockerfile.lfm -t dflash-lfm25 .
           docker run --rm dflash-lfm25 python -m py_compile \
             /app/src/dflash_mini_lab/lfm_all12_benchmark.py \
+            /app/src/dflash_mini_lab/lfm_all14_benchmark.py \
             /app/src/dflash_mini_lab/lfm_benchmark.py \
             /app/src/dflash_mini_lab/lfm_showcase.py \
             /app/src/dflash_mini_lab/lfm_dspark.py \
@@ -62,7 +67,10 @@ jobs:
             /app/src/dflash_mini_lab/v11_boltzmann_mobs.py \
             /app/src/dflash_mini_lab/v12_parareal.py \
             /app/src/dflash_mini_lab/v12_prepare.py \
-            /app/src/dflash_mini_lab/v12_benchmark.py
+            /app/src/dflash_mini_lab/v12_benchmark.py \
+            /app/src/dflash_mini_lab/v13_minop.py \
+            /app/src/dflash_mini_lab/v14_simple_parareal.py \
+            /app/src/dflash_mini_lab/v14_prepare.py
 
       - name: Prepare frozen LFM2.5 DFlash backbone
         run: |
@@ -113,7 +121,23 @@ jobs:
               --top-k 8 --correction-rounds 2 --damping 0.75 \
               --holdout-fraction 0.20 --cpu-threads 2
 
-      - name: Run Normal + 12 speculative methods on LFM2.5
+      - name: Prepare V14 simple fine-gap estimator
+        run: |
+          docker run --rm \
+            -e HF_HOME=/cache -e TRANSFORMERS_OFFLINE=1 -e HF_HUB_OFFLINE=1 \
+            -e CPU_THREADS=2 -e OMP_NUM_THREADS=2 -e MKL_NUM_THREADS=2 -e OPENBLAS_NUM_THREADS=2 \
+            -v "$PWD/hf-cache:/cache" \
+            -v "$PWD/lfm-artifacts:/app/lfm-artifacts" \
+            dflash-lfm25 \
+            python -m dflash_mini_lab.v14_prepare \
+              --aux /app/lfm-artifacts/lfm_aux.pt \
+              --output /app/lfm-artifacts/v14_simple_parareal.json \
+              --seeds /app/real_benchmarks/train_seeds.json \
+              --max-seed-count 24 --generation-tokens 24 \
+              --ridge 0.001 --damping 1.0 --switch-threshold 0.0 \
+              --max-corrections 1 --holdout-fraction 0.20 --cpu-threads 2
+
+      - name: Run Normal + 14 speculative methods on LFM2.5
         run: |
           mkdir -p lfm-reports
           docker run --rm \
@@ -123,10 +147,11 @@ jobs:
             -v "$PWD/lfm-artifacts:/app/lfm-artifacts:ro" \
             -v "$PWD/lfm-reports:/app/lfm-reports" \
             dflash-lfm25 \
-            python -m dflash_mini_lab.lfm_all12_benchmark \
+            python -m dflash_mini_lab.lfm_all14_benchmark \
               --aux /app/lfm-artifacts/lfm_aux.pt \
               --dspark /app/lfm-artifacts/lfm_dspark.pt \
               --v12-model /app/lfm-artifacts/v12_parareal.json \
+              --v14-model /app/lfm-artifacts/v14_simple_parareal.json \
               --prompts /app/real_benchmarks/prompts.json \
               --calibration-prompts /app/real_benchmarks/calibration_prompts.json \
               --output-dir /app/lfm-reports \
@@ -135,20 +160,20 @@ jobs:
               --top-k 8 --jump-weight 0.5 --fused-weight 1.0 \
               --boltzmann-temperature 0.15 --bmobs-temperature 0.35 \
               --cpu-threads 2 --dtype float32
-          sed -i 's/Cross-model Qwen\/EAGLE results are intentionally excluded from this site\./Only LFM2.5 results are published on this site./g' \
-            lfm-reports/report.html lfm-reports/index.html
 
-      - name: Validate one-model all-12 evidence
+      - name: Validate one-model all-14 evidence
         run: |
           test -s lfm-artifacts/lfm_aux.pt
           test -s lfm-artifacts/lfm_dspark.pt
           test -s lfm-artifacts/v12_parareal.json
+          test -s lfm-artifacts/v14_simple_parareal.json
           test -s lfm-reports/benchmark.json
           test -s lfm-reports/report.html
-          grep -q "LFM2.5 All-12 Study" lfm-reports/report.html
+          grep -q "LFM2.5 All-14 Study" lfm-reports/report.html
           grep -q "Speedup versus normal decoding" lfm-reports/report.html
           grep -q "Mechanism simulation" lfm-reports/report.html
-          grep -q "V12 PARAREAL" lfm-reports/report.html
+          grep -q "V13 MinOp" lfm-reports/report.html
+          grep -q "V14 Simple PARAREAL" lfm-reports/report.html
           ! grep -qi "Qwen" lfm-reports/report.html
           ! grep -qi "EAGLE" lfm-reports/report.html
           python - <<'PY'
@@ -159,9 +184,10 @@ jobs:
             'normal','dflash','dflash2','dflash3_mobs','dflash4_jump_mobs',
             'dflash5_fused_jump_mobs','dflash6_boltzmann','dflash6_bmobs',
             'dflash7_act','dspark_v9','boltzmann_v10',
-            'boltzmann_gated_mobs_v11','parareal_linear_v12'
+            'boltzmann_gated_mobs_v11','parareal_linear_v12',
+            'minop_v13','simple_parareal_v14'
           )
-          assert len(d['summary'])==13
+          assert len(d['summary'])==15
           for method in expected:
               s=d['summary'][method]
               assert s['all_exact'], method
@@ -169,19 +195,31 @@ jobs:
               assert s['speedup_vs_normal']>0, method
           assert d['config']['prompt_count']==6
           assert d['config']['repeats']==3
-          assert d['selected_settings']['v12']['correction_rounds']==2
-          print(json.dumps({'winner':d['winner'],'summary':d['summary']},indent=2))
+          assert d['selected_settings']['v13']['routing_budget']==1
+          assert d['selected_settings']['v14']['max_corrections']==1
+          h=d['calibration']['simple_parareal_v14']
+          assert h['rows']>0
+          assert 0.0 <= h['corrected_sign_accuracy'] <= 1.0
+          print(json.dumps({
+              'winner':d['winner'],
+              'v10':d['summary']['boltzmann_v10'],
+              'v12':d['summary']['parareal_linear_v12'],
+              'v13':d['summary']['minop_v13'],
+              'v14':d['summary']['simple_parareal_v14'],
+              'v14_holdout':h,
+          },indent=2))
           PY
 
       - name: Upload canonical LFM2.5 evidence
         uses: actions/upload-artifact@v4
         with:
-          name: lfm25-350m-all12
+          name: lfm25-350m-all14
           path: |
             lfm-reports/
             lfm-artifacts/manifest.json
             lfm-artifacts/distillation.json
             lfm-artifacts/v12_parareal.json
+            lfm-artifacts/v14_simple_parareal.json
           retention-days: 30
 
       - name: Publish benchmark summary
@@ -189,12 +227,12 @@ jobs:
           python - <<'PY' >> "$GITHUB_STEP_SUMMARY"
           import json
           d=json.load(open('lfm-reports/benchmark.json'))
-          print('# LFM2.5-350M — Normal + 12 speculative methods')
+          print('# LFM2.5-350M — Normal + 14 speculative methods')
           print(f"Fastest speculative method: **{d['winner']}**")
-          print('| Method | tok/s | vs normal | acceptance | target calls | exact |')
-          print('|---|---:|---:|---:|---:|:---:|')
+          print('| Method | tok/s | vs normal | acceptance | target calls | guidance | exact |')
+          print('|---|---:|---:|---:|---:|---:|:---:|')
           for name, s in sorted(d['summary'].items(), key=lambda x:x[1]['speedup_vs_normal'], reverse=True):
-              print(f"| {name} | {s['tokens_per_second_median']:.3f} | {s['speedup_vs_normal']:.3f}x | {100*s['mean_acceptance_rate']:.1f}% | {s['mean_target_forward_passes']:.2f} | {'yes' if s['all_exact'] else 'NO'} |")
+              print(f"| {name} | {s['tokens_per_second_median']:.3f} | {s['speedup_vs_normal']:.3f}x | {100*s['mean_acceptance_rate']:.1f}% | {s['mean_target_forward_passes']:.2f} | {s['mean_guidance_work']:.1f} | {'yes' if s['all_exact'] else 'NO'} |")
           PY
 
       - name: Prepare LFM2.5-only GitHub Pages site
@@ -214,7 +252,7 @@ jobs:
 
   deploy-pages:
     if: github.event_name != 'pull_request'
-    needs: lfm25-all12
+    needs: lfm25-all14
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -224,6 +262,6 @@ jobs:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
-      - name: Deploy LFM2.5 All-12 study
+      - name: Deploy LFM2.5 All-14 study
         id: deployment
         uses: actions/deploy-pages@v4
