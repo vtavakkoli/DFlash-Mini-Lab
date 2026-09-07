@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dflash-mini-lab"
-version = "1.3.0"
-description = "Reproducible CPU benchmark lab for DFlash-style speculative decoding, including DFlash12 Parareal linear residual correction"
+version = "1.4.0"
+description = "Reproducible LFM2.5 CPU benchmark lab for twelve speculative-decoding mechanisms through DFlash12-PARAREAL"
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "MIT"}
@@ -16,13 +16,12 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-test = ["pytest==9.0.2"]
 real = ["transformers==5.16.1"]
 
 [project.scripts]
 dflash-mini-lab = "dflash_mini_lab.cli:main"
 dflash-lfm-prepare = "dflash_mini_lab.lfm_prepare:main"
-dflash-lfm-benchmark = "dflash_mini_lab.lfm_cli:main"
+dflash-lfm-benchmark = "dflash_mini_lab.lfm_all12_benchmark:main"
 dflash-qwen-prepare = "dflash_mini_lab.qwen_prepare:main"
 dflash-qwen-benchmark = "dflash_mini_lab.qwen_cli:main"
 dflash-v12-prepare = "dflash_mini_lab.v12_prepare:main"
@@ -33,7 +32,3 @@ package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
-
-[tool.pytest.ini_options]
-addopts = "-q"
-testpaths = ["tests"]

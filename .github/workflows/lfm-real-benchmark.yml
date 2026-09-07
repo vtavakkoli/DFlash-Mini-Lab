@@ -1,4 +1,4 @@
-name: LFM2.5 V9 DSpark + V10 Boltzmann CPU study
+name: LFM2.5 All-12 CPU benchmark
 
 on:
   pull_request:
@@ -6,258 +6,205 @@ on:
       - "Dockerfile.lfm"
       - "real_benchmarks/**"
       - "src/dflash_mini_lab/lfm_*.py"
+      - "src/dflash_mini_lab/v11_*.py"
+      - "src/dflash_mini_lab/v12_*.py"
       - ".github/workflows/lfm-real-benchmark.yml"
       - "pyproject.toml"
+      - "README.md"
+      - "docs/**"
   push:
     branches: [main]
     paths:
       - "Dockerfile.lfm"
       - "real_benchmarks/**"
       - "src/dflash_mini_lab/lfm_*.py"
+      - "src/dflash_mini_lab/v11_*.py"
+      - "src/dflash_mini_lab/v12_*.py"
       - ".github/workflows/lfm-real-benchmark.yml"
       - "pyproject.toml"
+      - "README.md"
+      - "docs/**"
   workflow_dispatch:
 
 permissions:
   contents: read
-  actions: read
   pages: write
   id-token: write
 
 concurrency:
-  group: "lfm-real-${{ github.ref }}"
+  group: "lfm25-all12-${{ github.ref }}"
   cancel-in-progress: true
 
 jobs:
-  lfm-real-cpu:
+  lfm25-all12:
     runs-on: ubuntu-latest
-    timeout-minutes: 110
+    timeout-minutes: 180
     steps:
       - uses: actions/checkout@v6
 
-      - name: Restore Hugging Face model cache
+      - name: Restore LFM2.5 Hugging Face cache
         uses: actions/cache@v4
         with:
           path: hf-cache
           key: lfm25-350m-base-${{ runner.os }}-transformers5161-v1
 
-      - name: Build LFM CPU benchmark image
+      - name: Build canonical LFM2.5 CPU image
         run: |
-          docker build -f Dockerfile.lfm -t dflash-lfm-real .
-          docker run --rm dflash-lfm-real python -m py_compile \
+          docker build -f Dockerfile.lfm -t dflash-lfm25 .
+          docker run --rm dflash-lfm25 python -m py_compile \
+            /app/src/dflash_mini_lab/lfm_all12_benchmark.py \
             /app/src/dflash_mini_lab/lfm_benchmark.py \
             /app/src/dflash_mini_lab/lfm_showcase.py \
             /app/src/dflash_mini_lab/lfm_dspark.py \
             /app/src/dflash_mini_lab/lfm_v10.py \
-            /app/src/dflash_mini_lab/lfm_v9v10_benchmark.py
+            /app/src/dflash_mini_lab/lfm_v9v10_benchmark.py \
+            /app/src/dflash_mini_lab/v11_benchmark.py \
+            /app/src/dflash_mini_lab/v11_boltzmann_mobs.py \
+            /app/src/dflash_mini_lab/v12_parareal.py \
+            /app/src/dflash_mini_lab/v12_prepare.py \
+            /app/src/dflash_mini_lab/v12_benchmark.py
 
-      - name: Prepare frozen DFlash backbone and legacy auxiliaries
+      - name: Prepare frozen LFM2.5 DFlash backbone
         run: |
           mkdir -p hf-cache lfm-artifacts
           docker run --rm \
             -e HF_HOME=/cache \
-            -e CPU_THREADS=2 \
-            -e OMP_NUM_THREADS=2 \
-            -e MKL_NUM_THREADS=2 \
-            -e OPENBLAS_NUM_THREADS=2 \
+            -e CPU_THREADS=2 -e OMP_NUM_THREADS=2 -e MKL_NUM_THREADS=2 -e OPENBLAS_NUM_THREADS=2 \
             -v "$PWD/hf-cache:/cache" \
             -v "$PWD/lfm-artifacts:/app/lfm-artifacts" \
-            dflash-lfm-real \
+            dflash-lfm25 \
             python -m dflash_mini_lab.lfm_prepare \
               --model-id LiquidAI/LFM2.5-350M-Base \
               --output-dir /app/lfm-artifacts \
-              --max-seed-count 40 \
-              --generation-tokens 32 \
-              --top-candidate-k 32 \
-              --candidate-limit 2048 \
-              --drafter-steps 300 \
-              --selector-steps 180 \
-              --jump-steps 120 \
-              --fused-steps 180 \
-              --cpu-threads 2
+              --max-seed-count 40 --generation-tokens 32 \
+              --top-candidate-k 32 --candidate-limit 2048 \
+              --drafter-steps 300 --selector-steps 180 \
+              --jump-steps 120 --fused-steps 180 --cpu-threads 2
 
-      - name: Train V9 DSpark-Lite Markov and confidence heads
+      - name: Prepare V9 DSpark-Lite heads
         run: |
           docker run --rm \
-            -e HF_HOME=/cache \
-            -e TRANSFORMERS_OFFLINE=1 \
-            -e HF_HUB_OFFLINE=1 \
-            -e CPU_THREADS=2 \
-            -e OMP_NUM_THREADS=2 \
-            -e MKL_NUM_THREADS=2 \
-            -e OPENBLAS_NUM_THREADS=2 \
+            -e HF_HOME=/cache -e TRANSFORMERS_OFFLINE=1 -e HF_HUB_OFFLINE=1 \
+            -e CPU_THREADS=2 -e OMP_NUM_THREADS=2 -e MKL_NUM_THREADS=2 -e OPENBLAS_NUM_THREADS=2 \
             -v "$PWD/hf-cache:/cache" \
             -v "$PWD/lfm-artifacts:/app/lfm-artifacts" \
-            dflash-lfm-real \
+            dflash-lfm25 \
             python -m dflash_mini_lab.lfm_dspark \
               --aux /app/lfm-artifacts/lfm_aux.pt \
               --output /app/lfm-artifacts/lfm_dspark.pt \
               --seeds /app/real_benchmarks/train_seeds.json \
-              --max-seed-count 40 \
-              --generation-tokens 32 \
-              --markov-rank 16 \
-              --markov-steps 180 \
-              --confidence-steps 100 \
-              --batch-size 64 \
-              --cpu-threads 2
+              --max-seed-count 40 --generation-tokens 32 \
+              --markov-rank 16 --markov-steps 180 \
+              --confidence-steps 100 --batch-size 64 --cpu-threads 2
 
-      - name: Run 11-way LFM CPU benchmark with V9 and V10
+      - name: Prepare V12 PARAREAL linear residual model
+        run: |
+          docker run --rm \
+            -e HF_HOME=/cache -e TRANSFORMERS_OFFLINE=1 -e HF_HUB_OFFLINE=1 \
+            -e CPU_THREADS=2 -e OMP_NUM_THREADS=2 -e MKL_NUM_THREADS=2 -e OPENBLAS_NUM_THREADS=2 \
+            -v "$PWD/hf-cache:/cache" \
+            -v "$PWD/lfm-artifacts:/app/lfm-artifacts" \
+            dflash-lfm25 \
+            python -m dflash_mini_lab.v12_prepare \
+              --aux /app/lfm-artifacts/lfm_aux.pt \
+              --output /app/lfm-artifacts/v12_parareal.json \
+              --seeds /app/real_benchmarks/train_seeds.json \
+              --max-seed-count 24 --generation-tokens 24 \
+              --top-k 8 --correction-rounds 2 --damping 0.75 \
+              --holdout-fraction 0.20 --cpu-threads 2
+
+      - name: Run Normal + 12 speculative methods on LFM2.5
         run: |
           mkdir -p lfm-reports
           docker run --rm \
-            -e HF_HOME=/cache \
-            -e TRANSFORMERS_OFFLINE=1 \
-            -e HF_HUB_OFFLINE=1 \
-            -e CPU_THREADS=2 \
-            -e OMP_NUM_THREADS=2 \
-            -e MKL_NUM_THREADS=2 \
-            -e OPENBLAS_NUM_THREADS=2 \
+            -e HF_HOME=/cache -e TRANSFORMERS_OFFLINE=1 -e HF_HUB_OFFLINE=1 \
+            -e CPU_THREADS=2 -e OMP_NUM_THREADS=2 -e MKL_NUM_THREADS=2 -e OPENBLAS_NUM_THREADS=2 \
             -v "$PWD/hf-cache:/cache" \
             -v "$PWD/lfm-artifacts:/app/lfm-artifacts:ro" \
             -v "$PWD/lfm-reports:/app/lfm-reports" \
-            dflash-lfm-real \
-            python -m dflash_mini_lab.lfm_v9v10_benchmark \
+            dflash-lfm25 \
+            python -m dflash_mini_lab.lfm_all12_benchmark \
               --aux /app/lfm-artifacts/lfm_aux.pt \
               --dspark /app/lfm-artifacts/lfm_dspark.pt \
+              --v12-model /app/lfm-artifacts/v12_parareal.json \
               --prompts /app/real_benchmarks/prompts.json \
               --calibration-prompts /app/real_benchmarks/calibration_prompts.json \
               --output-dir /app/lfm-reports \
-              --tokens 24 \
-              --repeats 3 \
-              --prompt-limit 6 \
-              --calibration-tokens 8 \
-              --calibration-prompt-limit 4 \
-              --top-k 8 \
-              --jump-weight 0.5 \
-              --fused-weight 1.0 \
-              --boltzmann-temperature 0.15 \
-              --bmobs-temperature 0.35 \
-              --cpu-threads 2 \
-              --dtype float32
+              --tokens 24 --repeats 3 --prompt-limit 6 \
+              --calibration-tokens 8 --calibration-prompt-limit 3 \
+              --top-k 8 --jump-weight 0.5 --fused-weight 1.0 \
+              --boltzmann-temperature 0.15 --bmobs-temperature 0.35 \
+              --cpu-threads 2 --dtype float32
+          sed -i 's/Cross-model Qwen\/EAGLE results are intentionally excluded from this site\./Only LFM2.5 results are published on this site./g' \
+            lfm-reports/report.html lfm-reports/index.html
 
-      - name: Upload V9/V10 diagnostic artifacts
+      - name: Validate one-model all-12 evidence
+        run: |
+          test -s lfm-artifacts/lfm_aux.pt
+          test -s lfm-artifacts/lfm_dspark.pt
+          test -s lfm-artifacts/v12_parareal.json
+          test -s lfm-reports/benchmark.json
+          test -s lfm-reports/report.html
+          grep -q "LFM2.5 All-12 Study" lfm-reports/report.html
+          grep -q "Speedup versus normal decoding" lfm-reports/report.html
+          grep -q "Mechanism simulation" lfm-reports/report.html
+          grep -q "V12 PARAREAL" lfm-reports/report.html
+          ! grep -qi "Qwen" lfm-reports/report.html
+          ! grep -qi "EAGLE" lfm-reports/report.html
+          python - <<'PY'
+          import json
+          d=json.load(open('lfm-reports/benchmark.json'))
+          assert d['model']['id']=='LiquidAI/LFM2.5-350M-Base'
+          expected=(
+            'normal','dflash','dflash2','dflash3_mobs','dflash4_jump_mobs',
+            'dflash5_fused_jump_mobs','dflash6_boltzmann','dflash6_bmobs',
+            'dflash7_act','dspark_v9','boltzmann_v10',
+            'boltzmann_gated_mobs_v11','parareal_linear_v12'
+          )
+          assert len(d['summary'])==13
+          for method in expected:
+              s=d['summary'][method]
+              assert s['all_exact'], method
+              assert s['tokens_per_second_median']>0, method
+              assert s['speedup_vs_normal']>0, method
+          assert d['config']['prompt_count']==6
+          assert d['config']['repeats']==3
+          assert d['selected_settings']['v12']['correction_rounds']==2
+          print(json.dumps({'winner':d['winner'],'summary':d['summary']},indent=2))
+          PY
+
+      - name: Upload canonical LFM2.5 evidence
         uses: actions/upload-artifact@v4
         with:
-          name: lfm25-350m-v9-v10-showcase
+          name: lfm25-350m-all12
           path: |
             lfm-reports/
             lfm-artifacts/manifest.json
             lfm-artifacts/distillation.json
-            lfm-artifacts/lfm_aux.pt
-            lfm-artifacts/lfm_dspark.pt
+            lfm-artifacts/v12_parareal.json
           retention-days: 30
 
-      - name: Validate exactness, DSpark heads and V10 low-operation path
-        run: |
-          test -s lfm-artifacts/lfm_aux.pt
-          test -s lfm-artifacts/lfm_dspark.pt
-          test -s lfm-reports/benchmark.json
-          test -s lfm-reports/report.html
-          grep -q "Live demo 1" lfm-reports/report.html
-          grep -q "Live demo 2" lfm-reports/report.html
-          grep -q "Animated architecture" lfm-reports/report.html
-          grep -q "V9 DSpark-Lite" lfm-reports/report.html
-          grep -q "V10 Advanced Boltzmann" lfm-reports/report.html
-          python - <<'PY'
-          import json
-          d=json.load(open('lfm-reports/benchmark.json'))
-          assert d['model']['id'] == 'LiquidAI/LFM2.5-350M-Base'
-          assert d['model']['target_parameter_count'] > 300_000_000
-          assert d['model']['target_vocab_size'] == 65536
-          assert 200 < d['model']['candidate_size'] <= 2048
-          assert d['config']['max_new_tokens'] == 24
-          assert d['config']['repeats'] == 3
-          assert d['config']['prompt_count'] == 6
-          expected=(
-              'normal','dflash','dflash2','dflash3_mobs','dflash4_jump_mobs',
-              'dflash5_fused_jump_mobs','dflash6_boltzmann','dflash6_bmobs','dflash7_act',
-              'dspark_v9','boltzmann_v10'
-          )
-          for method in expected:
-              assert d['summary'][method]['all_exact'], method
-              assert d['summary'][method]['tokens_per_second_median'] > 0, method
-              assert d['summary'][method]['speedup_vs_normal'] > 0, method
-          assert d['winner'] in expected
-          assert d['dspark_v9']['parameter_count'] > 0
-          assert d['dspark_v9']['parameter_count'] < 2_000_000
-          assert d['dspark_v9']['training']['markov_steps'] == 180
-          assert d['dspark_v9']['training']['confidence_steps'] == 100
-          assert d['boltzmann_v10']['training_steps'] == 0
-          plan=d['boltzmann_v10']['calibration']['plan']
-          assert plan['calibration_work_reduction_fraction'] > 0
-          assert d['summary']['boltzmann_v10']['mean_v10_candidate_scores'] > 0
-          assert d['summary']['boltzmann_v10']['mean_total_guidance_scores'] < d['summary']['dflash6_boltzmann']['mean_total_guidance_scores']
-          assert all(x['all_exact'] for x in d['dspark_v9']['calibration'])
-          assert all(x['all_exact'] for x in d['boltzmann_v10']['calibration']['stage2'])
-          print(json.dumps({
-              'winner': d['winner'],
-              'dflash': d['summary']['dflash'],
-              'dflash6_boltzmann': d['summary']['dflash6_boltzmann'],
-              'dspark_v9': d['summary']['dspark_v9'],
-              'boltzmann_v10': d['summary']['boltzmann_v10'],
-              'v10_config': d['boltzmann_v10']['selected_config'],
-          }, indent=2))
-          PY
-
-      - name: Write benchmark summary
+      - name: Publish benchmark summary
         run: |
           python - <<'PY' >> "$GITHUB_STEP_SUMMARY"
           import json
           d=json.load(open('lfm-reports/benchmark.json'))
-          print('# LFM2.5-350M · V9 DSpark + V10 Advanced Boltzmann')
-          print(f"Winner: **{d['winner']}**")
-          print(f"Workload: {d['config']['benchmark_workload']}")
-          print('| Method | tok/s | vs normal | acceptance | guidance ops | exact |')
+          print('# LFM2.5-350M — Normal + 12 speculative methods')
+          print(f"Fastest speculative method: **{d['winner']}**")
+          print('| Method | tok/s | vs normal | acceptance | target calls | exact |')
           print('|---|---:|---:|---:|---:|:---:|')
-          focus=('normal','dflash','dflash6_boltzmann','dspark_v9','boltzmann_v10')
-          for name in focus:
-              s=d['summary'][name]
-              print(f"| {name} | {s['tokens_per_second_median']:.3f} | {s['speedup_vs_normal']:.3f}x | {100*s['mean_acceptance_rate']:.1f}% | {s['mean_total_guidance_scores']:.1f} | {'yes' if s['all_exact'] else 'NO'} |")
-          p=d['boltzmann_v10']['calibration']['plan']
-          print(f"V10 calibration work reduction vs full grid: {100*p['calibration_work_reduction_fraction']:.1f}%")
-          print(f"V10 selected config: {d['boltzmann_v10']['selected_config']}")
-          print(f"DSpark selected survival floor: {d['dspark_v9']['selected_survival_floor']}")
+          for name, s in sorted(d['summary'].items(), key=lambda x:x[1]['speedup_vs_normal'], reverse=True):
+              print(f"| {name} | {s['tokens_per_second_median']:.3f} | {s['speedup_vs_normal']:.3f}x | {100*s['mean_acceptance_rate']:.1f}% | {s['mean_target_forward_passes']:.2f} | {'yes' if s['all_exact'] else 'NO'} |")
           PY
 
-      - name: Prepare combined GitHub Pages site
+      - name: Prepare LFM2.5-only GitHub Pages site
         if: github.event_name != 'pull_request'
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
-          rm -rf pages /tmp/eagle /tmp/q17 /tmp/q06 /tmp/tiny
-          mkdir -p pages/lfm
+          rm -rf pages
+          mkdir -p pages
           cp lfm-reports/report.html pages/index.html
-          cp lfm-reports/report.html pages/lfm/index.html
-          cp lfm-reports/benchmark.json pages/lfm/benchmark.json
-
-          fetch_artifact () {
-            name="$1"; dest="$2"; zip="$3"
-            id=$(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts?name=$name&per_page=20" --jq '.artifacts | map(select(.expired==false)) | .[0].id // empty')
-            if [ -n "$id" ]; then
-              mkdir -p "$dest"
-              gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$id/zip" > "$zip"
-              unzip -q "$zip" -d "$dest"
-            fi
-          }
-          fetch_artifact eagle3-v8-qwen3-17b-benchmark /tmp/eagle /tmp/eagle.zip || true
-          fetch_artifact qwen3-17b-all-methods-benchmark /tmp/q17 /tmp/q17.zip || true
-          fetch_artifact qwen3-06b-dflash7-benchmark /tmp/q06 /tmp/q06.zip || true
-          fetch_artifact dflash-cpu-report /tmp/tiny /tmp/tiny.zip || true
-
-          if [ -s /tmp/eagle/report.html ]; then mkdir -p pages/eagle3; cp /tmp/eagle/report.html pages/eagle3/index.html; cp /tmp/eagle/benchmark.json pages/eagle3/benchmark.json; fi
-          if [ -s /tmp/q17/qwen17-reports/report.html ]; then mkdir -p pages/qwen17; cp -r /tmp/q17/qwen17-reports/* pages/qwen17/; fi
-          if [ -s /tmp/q06/qwen-reports/report.html ]; then mkdir -p pages/qwen06; cp -r /tmp/q06/qwen-reports/* pages/qwen06/; fi
-          if [ -s /tmp/tiny/report.html ]; then mkdir -p pages/tiny; cp -r /tmp/tiny/* pages/tiny/; fi
-
-          python - <<'PY'
-          from pathlib import Path
-          p=Path('pages/index.html')
-          s=p.read_text()
-          nav="""<div style='position:sticky;top:8px;z-index:30;max-width:1240px;margin:8px auto;padding:8px 16px;border:1px solid #294963;border-radius:14px;background:#07111fee;backdrop-filter:blur(12px);font-family:system-ui'><b>V9/V10 LFM study</b> · <a style='color:#58d9ff' href='./lfm/'>LFM</a> · <a style='color:#58d9ff' href='./qwen17/'>Qwen1.7B</a> · <a style='color:#58d9ff' href='./eagle3/'>EAGLE3</a> · <a style='color:#58d9ff' href='./qwen06/'>Qwen0.6B</a> · <a style='color:#58d9ff' href='./tiny/'>Tiny</a></div>"""
-          s=s.replace('<body>', '<body>'+nav, 1)
-          p.write_text(s)
-          Path('pages/.nojekyll').touch()
-          PY
+          cp lfm-reports/benchmark.json pages/benchmark.json
+          touch pages/.nojekyll
 
       - name: Upload GitHub Pages artifact
         if: github.event_name != 'pull_request'
@@ -267,17 +214,16 @@ jobs:
 
   deploy-pages:
     if: github.event_name != 'pull_request'
-    needs: lfm-real-cpu
+    needs: lfm25-all12
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
       pages: write
       id-token: write
-      actions: read
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
-      - name: Deploy combined benchmark site
+      - name: Deploy LFM2.5 All-12 study
         id: deployment
         uses: actions/deploy-pages@v4

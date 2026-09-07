@@ -1,46 +1,92 @@
-# Reproducibility guide
+# LFM2.5 All-12 reproducibility guide
 
-## Scope
+## Canonical scope
 
-This repository contains two distinct reproducibility surfaces:
+The active evidence surface of this repository is deliberately narrow:
 
-1. the compact/tiny CPU reference benchmark, designed for fast mechanism-level regression tests; and
-2. real-model LFM/Qwen experiments, including **DFlash12-PARAREAL**, which require the corresponding frozen target and auxiliary artifacts.
+> **one target model, one matched CPU protocol, normal decoding plus 12 speculative mechanisms.**
 
-Results from one surface must not be presented as measurements from the other.
-
-## Tiny runtime contract
-
-The default Docker image is CPU-only and intentionally keeps the runtime small. The model-builder stage creates the compact target/drafter artifacts deterministically and the final runtime executes the NumPy reference implementation.
-
-Recommended single-process settings:
-
-```bash
-docker build -t dflash-mini-lab .
-docker run --rm \
-  -e CPU_THREADS=1 \
-  -e OPENBLAS_NUM_THREADS=1 \
-  -e OMP_NUM_THREADS=1 \
-  -e MKL_NUM_THREADS=1 \
-  -v "$PWD/reports:/app/reports" \
-  dflash-mini-lab
-```
-
-The tiny path is intended for algorithm mechanics, regression testing, exactness checks, and controlled relative comparisons. Its absolute throughput must not be compared directly with production inference engines.
-
-## DFlash12-PARAREAL reproducibility contract
-
-DFlash12 separates **preparation** from **inference/benchmarking**.
-
-During preparation, a frozen LFM target is used to generate greedy teacher trajectories and fine logits. A compact ridge-regression artifact is then written to:
+Published benchmark evidence and GitHub Pages use only:
 
 ```text
-lfm-artifacts/v12_parareal.json
+LiquidAI/LFM2.5-350M-Base
 ```
 
-The JSON artifact contains only the linear correction parameters, feature-normalization statistics, configuration, and convergence metadata. It does not redistribute the target-model weights.
+Historical experiment code may remain in the repository, but Qwen, EAGLE and tiny-model runs are not part of the active CI result surface.
 
-Default V12 numerical settings are:
+## Active workflow
+
+The sole benchmark workflow is:
+
+```text
+.github/workflows/lfm-real-benchmark.yml
+```
+
+It performs the complete experiment from preparation through report generation:
+
+1. build the CPU LFM Docker image;
+2. prepare the frozen LFM2.5 DFlash backbone and candidate vocabulary;
+3. train the V9 DSpark-Lite heads;
+4. fit the V12 PARAREAL linear residual model on training trajectories;
+5. calibrate ACT, V9, V10 and V11 on calibration prompts;
+6. run Normal + all 12 speculative methods on held-out benchmark prompts;
+7. verify every final output against normal greedy LFM2.5;
+8. write `benchmark.json` and the professional HTML report;
+9. publish the LFM2.5-only GitHub Pages site on `main`.
+
+## Fixed target and runtime
+
+The canonical target is loaded in float32 CPU mode with two CPU threads in the GitHub Actions study. The workflow also pins the relevant package versions through the Docker build.
+
+The benchmark methods share:
+
+- target model and target revision available through the same Hugging Face cache;
+- candidate vocabulary and DFlash backbone;
+- benchmark prompts;
+- output length;
+- CPU thread settings;
+- exact target-verification logic.
+
+Do not compare absolute throughput from this reference runtime with a production serving engine unless the serving backend and measurement protocol are also matched.
+
+## Data separation
+
+The repository keeps three logically separate data roles.
+
+### Training seeds
+
+```text
+real_benchmarks/train_seeds.json
+```
+
+Used to prepare the DFlash auxiliaries, V9 heads, and V12 regression artifact.
+
+### Calibration prompts
+
+```text
+real_benchmarks/calibration_prompts.json
+```
+
+Used only to select bounded inference policies for methods that require calibration:
+
+- DFlash7-ACT margin threshold;
+- V9 DSpark survival floor;
+- V10 bounded Boltzmann configuration;
+- V11 uncertainty-gated MOBS configuration.
+
+### Benchmark prompts
+
+```text
+real_benchmarks/prompts.json
+```
+
+Used only for the final comparative timing/exactness study.
+
+Benchmark prompts must not be used to fit V12 or select the ACT/V9/V10/V11 policy.
+
+## V12 preparation
+
+Default canonical V12 settings:
 
 ```text
 top_k              = 8
@@ -49,156 +95,147 @@ damping            = 0.75
 ridge               = 0.001
 residual_clip       = 6.0
 interpolation       = [0.0, 0.5, 0.75]
-random seed         = 23
 ```
 
-The complete fitted configuration is stored in the artifact and should be reported with any benchmark result.
+The V12 artifact is:
 
-## Prepare V12 deterministically
-
-Use a fixed training-seed file and fixed CPU-thread count:
-
-```bash
-python -m dflash_mini_lab.v12_prepare \
-  --aux lfm-artifacts/lfm_aux.pt \
-  --seeds real_benchmarks/train_seeds.json \
-  --output lfm-artifacts/v12_parareal.json \
-  --max-seed-count 24 \
-  --generation-tokens 24 \
-  --top-k 8 \
-  --correction-rounds 2 \
-  --damping 0.75 \
-  --ridge 0.001 \
-  --cpu-threads 2 \
-  --seed 23
+```text
+lfm-artifacts/v12_parareal.json
 ```
 
-The preparation process:
+It contains the regression coefficients, feature-normalization statistics, configuration, and train/holdout convergence diagnostics. It does not contain LFM target weights.
 
-1. fixes Python, NumPy, and Torch RNG seeds;
-2. generates greedy target continuations;
-3. performs one full causal teacher pass over each completed trajectory and reuses those logits for all legal block windows;
-4. constructs DFlash top-k coarse score fields and target fine score fields on identical candidate IDs;
-5. fits the residual model with closed-form ridge regression;
-6. reserves an internal holdout partition;
-7. stores train and holdout convergence diagnostics in the JSON artifact.
+Preparation uses frozen greedy LFM teacher trajectories. The fine score field `F` exists only during preparation; inference uses the fitted linear residual surrogate.
 
-Because the model is fit with a deterministic linear solve, repeated runs with the same software stack, target/auxiliary artifacts, seed data, thread settings, and numerical libraries should produce equivalent fitted parameters up to the numerical behavior of the underlying BLAS/LAPACK implementation.
+## Canonical benchmark command
 
-## Train/holdout separation
-
-The preparation holdout is used only to diagnose whether the learned residual contracts teacher-space error. It is not used to choose target tokens during inference.
-
-The reported diagnostics are:
-
-- teacher-space MSE by correction round;
-- `log(MSE)` by correction round;
-- contraction ratio `E_(k+1) / E_k`;
-- fine-model top-1 agreement by correction round.
-
-A synthetic unit-test convergence result is not evidence of real-model convergence. Real-model claims must come from the holdout metrics stored in a newly prepared V12 artifact.
-
-## Benchmark V12
-
-Use a prompt file that is separate from the preparation seeds:
+After preparation:
 
 ```bash
-python -m dflash_mini_lab.v12_benchmark \
+python -m dflash_mini_lab.lfm_all12_benchmark \
   --aux lfm-artifacts/lfm_aux.pt \
   --dspark lfm-artifacts/lfm_dspark.pt \
   --v12-model lfm-artifacts/v12_parareal.json \
-  --prompts real_benchmarks/test_prompts.json \
-  --output-dir v12-reports \
+  --prompts real_benchmarks/prompts.json \
+  --calibration-prompts real_benchmarks/calibration_prompts.json \
+  --output-dir lfm-reports \
   --tokens 24 \
-  --repeats 2 \
-  --cpu-threads 2
+  --repeats 3 \
+  --prompt-limit 6 \
+  --calibration-tokens 8 \
+  --calibration-prompt-limit 3 \
+  --top-k 8 \
+  --cpu-threads 2 \
+  --dtype float32
 ```
 
-The benchmark writes:
+## Methods in the run
+
+The output contains 13 rows:
 
 ```text
-v12-reports/v12_benchmark.json
-v12-reports/v12_benchmark.md
+00 normal
+01 dflash
+02 dflash2
+03 dflash3_mobs
+04 dflash4_jump_mobs
+05 dflash5_fused_jump_mobs
+06 dflash6_boltzmann
+07 dflash6_bmobs
+08 dflash7_act
+09 dspark_v9
+10 boltzmann_v10
+11 boltzmann_gated_mobs_v11
+12 parareal_linear_v12
 ```
 
-The JSON file is the machine-readable source of truth. The Markdown report is a human-readable summary.
+Normal defines the exact reference and 1.000× baseline; the other twelve are the speculative methods.
 
-## What a V12 benchmark records
+## Timing discipline
 
-For Normal LFM, DFlash, V11, and V12, the benchmark records:
+The unified benchmark:
 
-- end-to-end generated tokens/sec;
-- end-to-end latency;
-- target time;
-- draft time;
-- selection/correction time;
-- target forward-pass count;
-- draft acceptance rate;
-- generated tokens per target pass;
-- exact-output comparison with normal greedy decoding.
+- warms the target and drafter before measured work;
+- computes a normal greedy reference for each prompt outside speculative exactness decisions;
+- times each decoder end to end for generation work;
+- rotates method order across prompt/repeat combinations;
+- reports median tokens/second and median latency;
+- records target, draft and selector/correction time;
+- records target-forward counts and tokens per target pass;
+- preserves every method result rather than publishing only the winner.
 
-V12 additionally records linear candidate-score work and the average correction-update RMS.
+Method-order rotation reduces systematic first-method bias but does not eliminate all hosted-runner variance. Repeated runs should be used for publication-quality confidence intervals.
 
-## Exactness requirement
+## Exactness gate
 
-Speculative proposals are never accepted without target verification. A benchmark result should be treated as valid only when `all_exact` is true for the method under discussion.
+A speculative result is valid only when:
 
-Exactness means that the complete generated sequence matches the normal target-only greedy sequence for the same prompt and output length. Teacher-space convergence metrics do not replace this check.
+```text
+all_exact == true
+```
 
-## Fair timing protocol
+for the method.
 
-For comparative measurements:
+Exactness means the full generated token sequence equals normal greedy LFM2.5 for the same prompt and output length. Acceptance rate, teacher-space convergence, or lower target-call count never substitutes for this check.
 
-- use the same machine and power/performance mode;
-- keep CPU-thread settings fixed across methods;
-- use the same target and auxiliary artifacts;
-- use the same prompt order and output length;
-- avoid mixing cold-start/model-load time with decode timing unless explicitly studying startup;
-- retain multiple repeats and report the aggregation rule;
-- preserve negative results rather than retuning until a preferred ranking appears.
+The workflow fails if any of the 13 paths is not exact.
 
-The V12 benchmark rotates method order across prompt/repeat pairs to reduce systematic ordering bias.
+## Speed claims
+
+A speed claim requires measured wall-clock throughput from the same run.
+
+The following are useful diagnostics but are not speed proofs by themselves:
+
+- draft acceptance;
+- tokens per target call;
+- guidance-operation count;
+- V12 teacher-space MSE;
+- V12 contraction ratio;
+- number of trimmed speculative tokens.
+
+Negative speedups are retained in `benchmark.json` and on the page.
+
+## Professional report contract
+
+The generated report includes:
+
+- a speedup-vs-normal chart;
+- acceptance/speed efficiency view;
+- complete exactness-gated table;
+- method evolution cards;
+- an interactive method explorer;
+- an animated mechanism simulation for every speculative method;
+- protocol and provenance notes.
+
+The animation is explanatory. It uses the measured aggregate profile to visualize the mechanism, while `benchmark.json` remains the machine-readable source of truth.
+
+Outputs:
+
+```text
+lfm-reports/index.html
+lfm-reports/report.html
+lfm-reports/benchmark.json
+```
 
 ## Artifact provenance
 
-For a publication-quality experiment, archive or record alongside the result:
+For publication-quality archiving, retain:
 
 - repository commit SHA;
-- V12 JSON artifact;
-- target model ID/revision if available;
-- auxiliary artifact identity;
-- training seed file and test prompt file;
-- exact CLI command;
-- Python and package versions;
-- CPU model and thread settings;
-- operating-system/container information.
+- `benchmark.json`;
+- `v12_parareal.json`;
+- LFM target model ID/revision;
+- auxiliary artifact manifest;
+- training/calibration/benchmark prompt files;
+- Docker image definition;
+- exact CLI arguments;
+- GitHub Actions run ID;
+- CPU/OS/container metadata where available.
 
-If artifacts are regenerated, treat them as a new experimental condition rather than assuming equivalence with an earlier run.
+Regenerating a learned auxiliary or V12 artifact constitutes a new experimental condition.
 
-## Unit tests
+## Interpretation of V12
 
-The V12 unit tests validate:
+DFlash12 is **Parareal-inspired**. It borrows the coarse/fine residual-correction principle and adapts it to a speculative top-k logit field using a learned linear surrogate. It is not claimed to be mathematically equivalent to the classical nonlinear-ODE Parareal solver.
 
-- geometric contraction on a controlled affine residual problem;
-- deterministic, shape-preserving parallel correction;
-- lossless JSON save/load of the fitted linear model.
-
-Run:
-
-```bash
-pytest -q tests/test_v12_parareal.py
-```
-
-or the complete repository suite:
-
-```bash
-pytest -q
-```
-
-## Interpretation discipline
-
-A lower correction error, higher acceptance rate, or fewer target calls does not by itself establish an end-to-end speedup. Only measured wall-clock throughput under the same workload supports a speed claim.
-
-Likewise, DFlash12 is **Parareal-inspired**: it borrows the coarse/fine residual-correction idea but operates on speculative logit fields with a learned linear surrogate. The repository does not claim equivalence to the classical nonlinear-ODE Parareal algorithm.
-
-See [`version12-parareal.md`](version12-parareal.md) for the complete V12 design and [`algorithm.md`](algorithm.md) for the broader method comparison.
+See [`version12-parareal.md`](version12-parareal.md) for the complete V12 design and [`algorithm.md`](algorithm.md) for all 12 methods.
