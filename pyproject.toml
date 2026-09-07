@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dflash-mini-lab"
-version = "1.6.0"
+version = "1.6.2"
 description = "Reproducible LFM2.5 CPU and CUDA benchmark lab for fourteen speculative-decoding mechanisms through V13 MinOp and V14 Simple PARAREAL"
 readme = "README.md"
 requires-python = ">=3.10"
