@@ -16,14 +16,18 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /app
 
 RUN python -m pip install --upgrade pip \
- && python -m pip install install torch torchvision --index-url https://download.pytorch.org/whl/cu132 \
+ && python -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cu132 \
  && python -m pip install numpy transformers
 
 COPY src ./src
 COPY real_benchmarks ./real_benchmarks
 COPY scripts ./scripts
 COPY run_gpu.py ./run_gpu.py
-RUN chmod +x /app/scripts/test_gpu.sh
+
+# Windows checkouts can provide CRLF shell scripts. Normalize inside the Linux image
+# as a second line of defense in addition to .gitattributes.
+RUN sed -i 's/\r$//' /app/scripts/test_gpu.sh \
+ && chmod +x /app/scripts/test_gpu.sh
 
 RUN mkdir -p /cache /app/lfm-artifacts /app/gpu-reports
 
