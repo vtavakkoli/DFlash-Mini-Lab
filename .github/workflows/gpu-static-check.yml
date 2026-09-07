@@ -1,27 +1,31 @@
-name: GPU Docker static check
+name: GPU direct-runner static check
 
 on:
   pull_request:
     paths:
       - "Dockerfile.gpu"
       - "docker-compose.yml"
+      - "run_gpu.py"
       - "scripts/test_gpu.sh"
       - "src/dflash_mini_lab/lfm_gpu_*.py"
       - "pyproject.toml"
       - "README.md"
       - "docs/gpu.md"
       - ".github/workflows/gpu-static-check.yml"
+      - ".github/workflows/publish-artifacts.yml"
   push:
     branches: [main]
     paths:
       - "Dockerfile.gpu"
       - "docker-compose.yml"
+      - "run_gpu.py"
       - "scripts/test_gpu.sh"
       - "src/dflash_mini_lab/lfm_gpu_*.py"
       - "pyproject.toml"
       - "README.md"
       - "docs/gpu.md"
       - ".github/workflows/gpu-static-check.yml"
+      - ".github/workflows/publish-artifacts.yml"
 
 permissions:
   contents: read
@@ -33,12 +37,39 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - name: Compile GPU Python modules
+      - name: Compile direct runner and GPU modules
         run: |
           python -m py_compile \
+            run_gpu.py \
             src/dflash_mini_lab/lfm_gpu_runtime.py \
             src/dflash_mini_lab/lfm_gpu_check.py \
             src/dflash_mini_lab/lfm_gpu_benchmark.py
+          python run_gpu.py --help >/dev/null
+
+      - name: Test zero-install direct artifact downloader
+        run: |
+          mkdir -p mock-release mock-downloaded
+          printf 'aux-pt-test\n' > mock-release/lfm_aux.pt
+          printf 'dspark-pt-test\n' > mock-release/lfm_dspark.pt
+          printf '{"test":"v12"}\n' > mock-release/v12_parareal.json
+          printf '{"test":"v14"}\n' > mock-release/v14_simple_parareal.json
+          python - <<'PY'
+          import hashlib, json
+          from pathlib import Path
+          root=Path('mock-release')
+          names=('lfm_aux.pt','lfm_dspark.pt','v12_parareal.json','v14_simple_parareal.json')
+          files={}
+          for name in names:
+              p=root/name
+              files[name]={'sha256':hashlib.sha256(p.read_bytes()).hexdigest(),'size_bytes':p.stat().st_size}
+          (root/'artifact-manifest.json').write_text(json.dumps({'format_version':1,'model_id':'test','source_sha':'test','files':files}),encoding='utf-8')
+          PY
+          python run_gpu.py \
+            --download-only \
+            --artifact-base-url "file://$PWD/mock-release" \
+            --artifact-dir mock-downloaded
+          cmp mock-release/lfm_aux.pt mock-downloaded/lfm_aux.pt
+          cmp mock-release/lfm_dspark.pt mock-downloaded/lfm_dspark.pt
 
       - name: Validate GPU shell entrypoint
         run: bash -n scripts/test_gpu.sh
@@ -48,8 +79,13 @@ jobs:
           docker compose --profile gpu config -q
           docker compose --profile gpu config --services | grep -qx test-gpu
 
-      - name: Verify CUDA wheel pin
+      - name: Verify CUDA and zero-install Docker path
         run: |
           grep -q 'torch==2.10.0' Dockerfile.gpu
           grep -q 'download.pytorch.org/whl/cu128' Dockerfile.gpu
+          grep -q 'COPY run_gpu.py' Dockerfile.gpu
+          ! grep -q 'pip install \.' Dockerfile.gpu
           grep -q 'gpus: all' docker-compose.yml
+          grep -q 'gh release upload' .github/workflows/publish-artifacts.yml
+          grep -q 'lfm_aux.pt' .github/workflows/publish-artifacts.yml
+          grep -q 'lfm_dspark.pt' .github/workflows/publish-artifacts.yml
