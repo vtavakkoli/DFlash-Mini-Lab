@@ -17,14 +17,13 @@ WORKDIR /app
 
 RUN python -m pip install --upgrade pip \
  && python -m pip install torch==2.10.0 --index-url https://download.pytorch.org/whl/cu128 \
- && python -m pip install transformers==5.16.1
+ && python -m pip install numpy==2.3.5 transformers==5.16.1
 
-COPY pyproject.toml README.md LICENSE requirements.txt ./
 COPY src ./src
 COPY real_benchmarks ./real_benchmarks
 COPY scripts ./scripts
-RUN python -m pip install . \
- && chmod +x /app/scripts/test_gpu.sh
+COPY run_gpu.py ./run_gpu.py
+RUN chmod +x /app/scripts/test_gpu.sh
 
 RUN mkdir -p /cache /app/lfm-artifacts /app/gpu-reports
 
