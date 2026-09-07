@@ -1,17 +1,91 @@
 # DFlash Mini Lab
 
-A reproducible **CPU speculative-decoding research lab centered on one canonical target: `LiquidAI/LFM2.5-350M-Base`**.
+A reproducible **LFM2.5 speculative-decoding research lab** centered on one target: `LiquidAI/LFM2.5-350M-Base`.
 
-The active benchmark compares **14 speculative mechanisms** under one matched LFM2.5 protocol, plus normal target-only greedy decoding as the baseline. Every speculative output is verified by the same target model and must exactly match normal greedy output.
+The canonical published study compares **14 speculative mechanisms** plus normal greedy decoding on CPU. A separate Docker Compose GPU path runs the same All-14 method logic with the LFM target and DFlash drafter on CUDA.
 
 > [!IMPORTANT]
-> This repository is a mechanism-level research/reference implementation. DFlash3 through DFlash14 are experimental lab variants and are not upstream official DFlash releases.
+> DFlash3 through DFlash14 are experimental DFlash Mini Lab variants and are not upstream official DFlash releases.
 
-## Canonical result page
+## Canonical CPU result page
 
 **https://vtavakkoli.github.io/DFlash-Mini-Lab/**
 
-The GitHub Pages site is generated from the unified LFM2.5 workflow and reports speedup, tokens/second, acceptance, target-forward count, tokens/target-call, selector/correction work, exactness, and an animated mechanism explorer. The machine-readable source of truth is `benchmark.json`.
+The GitHub Pages site is generated from the unified LFM2.5 CPU workflow and reports speedup, tokens/second, acceptance, target-forward count, tokens/target-call, selector/correction work, exactness, and an animated mechanism explorer. The machine-readable source of truth is `benchmark.json`.
+
+## GPU test with Docker Compose
+
+The repository now includes a CUDA-enabled local benchmark path.
+
+### Prerequisites
+
+- NVIDIA GPU + recent NVIDIA driver;
+- Docker;
+- NVIDIA Container Toolkit configured for Docker;
+- Docker Compose v2 with GPU support.
+
+### Run the full GPU benchmark
+
+```bash
+docker compose --profile gpu run --rm test-gpu
+```
+
+Legacy Compose syntax, when installed:
+
+```bash
+docker-compose --profile gpu run --rm test-gpu
+```
+
+The service does **not** silently fall back to CPU. It first checks:
+
+- `torch.cuda.is_available()`;
+- detected GPU(s), memory and compute capability;
+- PyTorch/CUDA/cuDNN versions;
+- a real FP16 matrix multiplication on CUDA.
+
+If the check passes, the service prepares any missing LFM2.5 artifacts and runs Normal + all 14 speculative methods with exact greedy verification.
+
+### Quick smoke test
+
+```bash
+GPU_PROMPT_LIMIT=1 GPU_REPEATS=1 GPU_TOKENS=8 \
+  docker compose --profile gpu run --rm test-gpu
+```
+
+### GPU outputs
+
+```text
+gpu-reports/index.html
+gpu-reports/report.html
+gpu-reports/benchmark.json
+```
+
+Artifacts are persisted in:
+
+```text
+gpu-artifacts/
+```
+
+and reused on later runs.
+
+Default target dtype is FP16:
+
+```text
+LFM_GPU_DTYPE=float16
+```
+
+Supported values are `float16`, `bfloat16`, and `float32`.
+
+Example:
+
+```bash
+LFM_GPU_DTYPE=float32 CUDA_DEVICE=0 \
+  docker compose --profile gpu run --rm test-gpu
+```
+
+The CUDA runtime moves the **LFM target/verifier and DFlash drafter** to GPU. Small MOBS/DSpark/Parareal routing remains CPU/NumPy so the selection logic stays aligned with the CPU implementation; host/device transfer cost is included in wall-clock measurements.
+
+See [`docs/gpu.md`](docs/gpu.md) for the complete GPU protocol and interpretation rules.
 
 ## The 14 speculative methods
 
@@ -32,11 +106,11 @@ The GitHub Pages site is generated from the unified LFM2.5 workflow and reports 
 | 13 | **V13 MinOp** | **V10 policy with fused Torch top-2 + one-slot budget** | **O(B) routing after top-2** |
 | 14 | **V14 Simple PARAREAL** | **Three-coefficient fine-gap estimator + one residual update** | **O(B) scalar correction** |
 
-Normal autoregressive LFM2.5 is method `00` and defines the exact reference and `1.000×` speed baseline.
+Normal autoregressive LFM2.5 is method `00` and defines the exact reference and `1.000×` speed baseline inside each matched run.
 
-## V13 MinOp — simplified and optimized V10
+## V13 MinOp
 
-The previous LFM2.5 study showed that V10 improved draft acceptance and target-pass efficiency but paid a small selector cost. V13 keeps the useful V10 decision policy while removing avoidable data movement and search work.
+V13 keeps the V10 decision policy while removing avoidable top-k plumbing:
 
 ```text
 context
@@ -45,7 +119,6 @@ context
 DFlash drafter
   │
   ├─ full logits stay in Torch
-  │
   └─ torch.topk(k=2)
        │
        ▼
@@ -61,38 +134,34 @@ least-confident eligible slot only
 LFM2.5 exact verify
 ```
 
-V13 deliberately **reuses the configuration selected for V10**. It is not separately tuned. This makes the V10→V13 comparison primarily an implementation/operation-cost experiment.
+V13 deliberately reuses the configuration selected for V10. This makes the V10→V13 comparison primarily an implementation/operation-cost experiment.
 
-## V14 Simple PARAREAL — simple estimator for the fine model
+## V14 Simple PARAREAL
 
-V12 learns a residual over the complete `B × K` score field. V14 asks whether the Parareal idea can be compressed to the smallest useful state: the signed gap between the draft top-1 and top-2 candidates.
-
-For each block position:
+V14 compresses the Parareal state to the signed top1-top2 gap:
 
 ```text
 G = draft_top1_logit - draft_top2_logit
 F = target_logit(draft_top1) - target_logit(draft_top2)   # preparation only
 ```
 
-V14 fits only three coefficients:
+It fits only three coefficients:
 
 ```text
 F_hat = a + b·G + c·normalized_position
 ```
 
-and performs one Parareal-style update:
+and performs one update:
 
 ```text
 gap_1 = G + damping · (F_hat - G)
 ```
 
-At inference, at most one position may switch from draft top-1 to draft top-2. The estimator is ordinary closed-form ridge regression; there is no neural correction model and no target-model call beyond the normal authoritative verifier.
+At inference, at most one position may switch from draft top-1 to draft top-2. The estimator is closed-form ridge regression; there is no neural correction model and no target-model call beyond the normal authoritative verifier.
 
-The artifact `lfm-artifacts/v14_simple_parareal.json` stores the three coefficients, configuration, and train/holdout diagnostics only. It does not redistribute target weights.
+See [`docs/version13-14.md`](docs/version13-14.md).
 
-See [`docs/version13-14.md`](docs/version13-14.md) for the design and interpretation rules.
-
-## Reproduce the canonical study
+## Reproduce the canonical CPU study
 
 Build the CPU image:
 
@@ -100,7 +169,7 @@ Build the CPU image:
 docker build -f Dockerfile.lfm -t dflash-lfm25 .
 ```
 
-Prepare the common backbone, V9, V12 and V14 artifacts:
+Prepare the common artifacts:
 
 ```bash
 python -m dflash_mini_lab.lfm_prepare \
@@ -134,48 +203,38 @@ python -m dflash_mini_lab.lfm_all14_benchmark \
   --prompts real_benchmarks/prompts.json \
   --calibration-prompts real_benchmarks/calibration_prompts.json \
   --output-dir lfm-reports \
-  --tokens 24 \
-  --repeats 3 \
-  --prompt-limit 6 \
-  --top-k 8 \
-  --cpu-threads 2
-```
-
-Outputs:
-
-```text
-lfm-reports/index.html
-lfm-reports/report.html
-lfm-reports/benchmark.json
+  --tokens 24 --repeats 3 --prompt-limit 6 \
+  --top-k 8 --cpu-threads 2
 ```
 
 ## Benchmark discipline
 
-1. **One target model:** all active performance evidence uses LFM2.5-350M-Base.
+1. **One target model:** LFM2.5-350M-Base.
 2. **Held-out benchmark prompts:** benchmark prompts are not used to fit V12 or V14.
-3. **Separate calibration prompts:** ACT, V9, V10 and V11 are calibrated outside the benchmark workload; V13 reuses the selected V10 policy.
+3. **Separate calibration prompts:** ACT, V9, V10 and V11 calibrate outside the benchmark workload; V13 reuses V10.
 4. **Rotated execution order:** method order changes across prompt/repeat combinations.
-5. **Exactness gate:** all 15 paths—Normal + 14 speculative methods—must reproduce normal greedy LFM output.
+5. **Exactness gate:** all 15 paths must reproduce normal greedy output for the same backend/dtype.
 6. **No result cherry-picking:** negative speedups are retained.
-7. **Matched runtime:** methods share the model, CPU settings, workload and verifier.
+7. **Matched runtime:** comparisons are valid inside a matched CPU run or inside a matched GPU run. Do not mix the two rankings as if they were one experiment.
 
-See [`docs/reproducibility.md`](docs/reproducibility.md) for the complete protocol.
+See [`docs/reproducibility.md`](docs/reproducibility.md).
 
 ## Repository layout
 
 ```text
-src/dflash_mini_lab/lfm_runtime.py            LFM2.5 target + compact DFlash auxiliaries
-src/dflash_mini_lab/lfm_benchmark.py          DFlash through DFlash6
-src/dflash_mini_lab/lfm_showcase.py           DFlash7-ACT
-src/dflash_mini_lab/lfm_dspark.py             V9 DSpark-Lite
-src/dflash_mini_lab/lfm_v10.py                V10 selector
-src/dflash_mini_lab/v11_boltzmann_mobs.py     V11 selector
-src/dflash_mini_lab/v12_parareal.py           V12 full-field linear residual correction
-src/dflash_mini_lab/v13_minop.py              V13 fused top-2 MinOp decoder
-src/dflash_mini_lab/v14_simple_parareal.py    V14 scalar Parareal decoder
-src/dflash_mini_lab/v14_prepare.py             V14 fine-gap estimator fitting
-src/dflash_mini_lab/lfm_all14_benchmark.py    canonical Normal + 14 benchmark/report
-.github/workflows/lfm-real-benchmark.yml       sole active benchmark/evidence workflow
+Dockerfile.lfm                              canonical CPU image
+Dockerfile.gpu                              CUDA 12.8 PyTorch image
+docker-compose.yml                          benchmark + test-gpu services
+scripts/test_gpu.sh                         one-command GPU check/prep/benchmark
+src/dflash_mini_lab/lfm_runtime.py          CPU LFM2.5 reference runtime
+src/dflash_mini_lab/lfm_gpu_runtime.py      CUDA target + DFlash drafter runtime
+src/dflash_mini_lab/lfm_gpu_check.py        CUDA capability/matmul verification
+src/dflash_mini_lab/lfm_gpu_benchmark.py    GPU All-14 benchmark entrypoint
+src/dflash_mini_lab/lfm_all14_benchmark.py  canonical All-14 method/report logic
+src/dflash_mini_lab/v13_minop.py            V13 MinOp
+src/dflash_mini_lab/v14_simple_parareal.py  V14 scalar Parareal
+docs/gpu.md                                 GPU protocol
+.github/workflows/lfm-real-benchmark.yml     canonical CPU evidence workflow
 ```
 
 ## References

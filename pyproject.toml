@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dflash-mini-lab"
-version = "1.5.0"
-description = "Reproducible LFM2.5 CPU benchmark lab for fourteen speculative-decoding mechanisms through V13 MinOp and V14 Simple PARAREAL"
+version = "1.6.0"
+description = "Reproducible LFM2.5 CPU and CUDA benchmark lab for fourteen speculative-decoding mechanisms through V13 MinOp and V14 Simple PARAREAL"
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "MIT"}
@@ -22,6 +22,8 @@ real = ["transformers==5.16.1"]
 dflash-mini-lab = "dflash_mini_lab.cli:main"
 dflash-lfm-prepare = "dflash_mini_lab.lfm_prepare:main"
 dflash-lfm-benchmark = "dflash_mini_lab.lfm_all14_benchmark:main"
+dflash-lfm-gpu-check = "dflash_mini_lab.lfm_gpu_check:main"
+dflash-lfm-gpu-benchmark = "dflash_mini_lab.lfm_gpu_benchmark:main"
 dflash-qwen-prepare = "dflash_mini_lab.qwen_prepare:main"
 dflash-qwen-benchmark = "dflash_mini_lab.qwen_cli:main"
 dflash-v12-prepare = "dflash_mini_lab.v12_prepare:main"
