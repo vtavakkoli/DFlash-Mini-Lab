@@ -10,7 +10,7 @@ from .lfm_dspark import LfmDSparkRuntime
 
 
 class _CudaDrafterAdapter:
-    """Keep existing drafter API while moving CPU inputs onto CUDA."""
+    """Keep the existing drafter API while moving CPU inputs onto CUDA."""
 
     def __init__(self, module: torch.nn.Module, device: torch.device):
         self.module = module
@@ -66,9 +66,9 @@ class LfmGpuRuntime(LfmDSparkRuntime):
                 "NVIDIA Container Toolkit and start this service with GPU access."
             )
 
-        # Load the frozen artifacts in their existing CPU-compatible format first.
-        # We move only the expensive inference modules after the DSpark arrays have
-        # been materialized by the parent runtime.
+        # Load frozen artifacts in their existing CPU-compatible representation.
+        # DSpark/selector arrays are materialized before the expensive modules are
+        # moved to CUDA.
         super().__init__(
             aux_path,
             dspark_path,
@@ -109,10 +109,15 @@ class LfmGpuRuntime(LfmDSparkRuntime):
         # Target dominates runtime, so it is the primary CUDA resident.
         self.target.to(device=self.device, dtype=self.gpu_dtype)
         self.target.eval()
-        self.embedding = self.target.get_input_embeddings().weight.detach()
+        self.gpu_embedding = self.target.get_input_embeddings().weight.detach()
 
-        # The DFlash drafter is tiny but runs once per speculative block. Move it
-        # to CUDA too; the adapter makes legacy CPU-created input tensors work.
+        # V12 and a few legacy selectors index runtime.embedding from CPU code.
+        # Keep a CPU float32 copy for those tiny top-k lookups, while context
+        # construction uses gpu_embedding and therefore stays CUDA-accelerated.
+        self.embedding = self.gpu_embedding.float().cpu()
+
+        # The DFlash drafter runs once per speculative block. Move it to CUDA;
+        # the adapter makes legacy CPU-created input tensors work unchanged.
         drafter_module = self.drafter.to(self.device).eval()
         self.drafter = _CudaDrafterAdapter(drafter_module, self.device)
 
@@ -134,6 +139,7 @@ class LfmGpuRuntime(LfmDSparkRuntime):
             "target_on_gpu": True,
             "drafter_on_gpu": True,
             "guidance_on_cpu": True,
+            "cpu_embedding_copy_for_selectors": True,
         }
         self.device_info = info
         type(self).last_device_info = info
@@ -148,7 +154,7 @@ class LfmGpuRuntime(LfmDSparkRuntime):
     @torch.inference_mode()
     def context_features(self, input_ids: np.ndarray) -> np.ndarray:
         ids = torch.from_numpy(np.asarray(input_ids, dtype=np.int64)).long().to(self.device)
-        emb = self.embedding.index_select(0, ids).float()
+        emb = self.gpu_embedding.index_select(0, ids).float()
         n = int(self.config.context_tokens)
         recent = emb[max(0, int(emb.shape[0]) - n) :]
         if int(recent.shape[0]) < n:
