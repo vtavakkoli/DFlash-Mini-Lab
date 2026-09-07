@@ -14,7 +14,7 @@ WORKDIR /app
 
 RUN python -m pip install --upgrade pip \
  && python -m pip install torch torchvision \
- && python -m pip install numpy==2.3.5 transformers==5.16.1
+ && python -m pip install numpy transformers
 
 COPY src ./src
 COPY real_benchmarks ./real_benchmarks
