@@ -15,3 +15,6 @@ reports/*.html
 reports/*.gif
 reports/*.tmp
 ci-reports/
+hf-cache/
+gpu-artifacts/
+gpu-reports/
