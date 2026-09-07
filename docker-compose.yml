@@ -13,6 +13,7 @@ services:
 
   test-cpu:
     profiles: ["cpu"]
+    image: dflash-mini-lab-test-cpu:latest
     build:
       context: .
       dockerfile: Dockerfile.cpu
@@ -41,6 +42,7 @@ services:
 
   test-gpu:
     profiles: ["gpu"]
+    image: dflash-mini-lab-test-gpu:latest
     build:
       context: .
       dockerfile: Dockerfile.gpu
