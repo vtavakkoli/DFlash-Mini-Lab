@@ -11,29 +11,94 @@ The CUDA runtime moves the two dominant inference components to the selected NVI
 
 The small routing/guidance components remain on CPU/NumPy so V1–V14 keep the same selection logic as the CPU study. Host/device transfer is included in measured wall time.
 
-## Prerequisites
+## Preferred direct Python command
+
+From the repository root:
+
+```bash
+python run_gpu.py
+```
+
+The repository package itself does not need to be installed. `run_gpu.py` inserts `src/` into `sys.path` before importing DFlash Mini Lab code.
+
+If required runtime libraries are missing, the runner can install only the pinned runtime dependencies and restart itself. It never performs `pip install .` or `pip install -e .`.
+
+Useful modes:
+
+```bash
+python run_gpu.py --smoke
+python run_gpu.py --download-only
+python run_gpu.py --check-only
+```
+
+`--smoke` uses one benchmark prompt, eight generated tokens and one repeat.
+
+## Prepared artifacts are downloaded directly
+
+The first run does not retrain the DFlash/DSpark/Parareal artifacts. Instead it downloads these individual files directly from the persistent GitHub Release `lfm25-all14-artifacts-v1`:
+
+```text
+lfm_aux.pt
+lfm_dspark.pt
+v12_parareal.json
+v14_simple_parareal.json
+artifact-manifest.json
+```
+
+The manifest records SHA-256 and byte size for every prepared file. `run_gpu.py` verifies both before loading the artifacts. Partial downloads use a `.part` file and are never accepted as valid artifacts.
+
+Files are cached locally in:
+
+```text
+gpu-artifacts/
+```
+
+Force a new verified download with:
+
+```bash
+python run_gpu.py --refresh-artifacts
+```
+
+A custom artifact mirror can be selected with:
+
+```bash
+python run_gpu.py --artifact-base-url https://example.invalid/dflash-artifacts
+```
+
+or with the `DFLASH_ARTIFACT_BASE_URL` environment variable.
+
+The target model weights are not redistributed by this release. Transformers still obtains `LiquidAI/LFM2.5-350M-Base` from its official Hugging Face source/cache.
+
+## Direct-Python prerequisites
 
 You need:
 
-1. an NVIDIA GPU supported by your installed driver;
-2. Docker with NVIDIA Container Toolkit configured;
-3. Docker Compose v2 with GPU support.
+1. a supported NVIDIA GPU and driver;
+2. Python 3.10+;
+3. internet access on the first run for the release artifacts and, when not cached, the target model.
 
-A local CUDA toolkit is not required by the container. The image installs the PyTorch 2.10 CUDA 12.8 wheel and uses the host NVIDIA driver through the container runtime.
+A local CUDA toolkit is not required by PyTorch wheels. If a CPU-only PyTorch installation is detected, the bootstrap path installs PyTorch 2.10.0 from the CUDA 12.8 wheel index. If a CUDA-enabled PyTorch build exists but the driver/GPU is not visible, the runner does not hide that error or silently fall back to CPU.
 
-## One-command test
+## Docker Compose
+
+Docker remains available when you want a fully pinned container environment:
 
 ```bash
 docker compose --profile gpu run --rm test-gpu
 ```
 
-Old Compose syntax also works when available:
+The Docker image uses the same `run_gpu.py` path. It installs PyTorch/Transformers dependencies in the image but does **not** install the DFlash Mini Lab repository as a package.
 
-```bash
-docker-compose --profile gpu run --rm test-gpu
-```
+Docker prerequisites:
 
-The service first runs a real CUDA check:
+1. NVIDIA GPU + recent driver;
+2. Docker;
+3. NVIDIA Container Toolkit configured for Docker;
+4. Docker Compose v2 with GPU support.
+
+A local CUDA toolkit is not required by the container. The image installs the PyTorch 2.10 CUDA 12.8 wheel and uses the host NVIDIA driver through the container runtime.
+
+The service runs a real CUDA check:
 
 - `torch.cuda.is_available()`;
 - CUDA device count;
@@ -42,21 +107,6 @@ The service first runs a real CUDA check:
 - a real FP16 CUDA matrix multiplication.
 
 If CUDA is not visible, the command exits non-zero. It never silently falls back to CPU.
-
-## First run
-
-The first run prepares the same frozen LFM2.5 auxiliary artifacts used by the CPU benchmark if they do not already exist:
-
-```text
-gpu-artifacts/lfm_aux.pt
-gpu-artifacts/lfm_dspark.pt
-gpu-artifacts/v12_parareal.json
-gpu-artifacts/v14_simple_parareal.json
-```
-
-These artifacts are persisted on the host and reused on later runs.
-
-The preparation code remains CPU-compatible by design; the measured All-14 inference benchmark then moves the LFM target and DFlash drafter to CUDA.
 
 ## Outputs
 
@@ -70,7 +120,7 @@ gpu-reports/benchmark.json
 
 ## Full benchmark defaults
 
-The Compose service defaults to the same benchmark workload shape as the canonical study:
+The runner defaults to the same benchmark workload shape as the canonical study:
 
 ```text
 6 held-out prompts
@@ -81,17 +131,6 @@ The Compose service defaults to the same benchmark workload shape as the canonic
 ```
 
 All 15 paths must exactly match the GPU normal-greedy reference.
-
-## Fast smoke test
-
-For a quick CUDA/integration test:
-
-```bash
-GPU_PROMPT_LIMIT=1 GPU_REPEATS=1 GPU_TOKENS=8 \
-  docker compose --profile gpu run --rm test-gpu
-```
-
-The first invocation may still need to prepare artifacts. After artifacts exist, the smoke test is much faster.
 
 ## Dtype
 
@@ -109,9 +148,10 @@ bfloat16
 float32
 ```
 
-Example:
+Examples:
 
 ```bash
+python run_gpu.py --dtype float32
 LFM_GPU_DTYPE=float32 docker compose --profile gpu run --rm test-gpu
 ```
 
@@ -119,11 +159,17 @@ The target uses this dtype. The DFlash drafter remains float32.
 
 ## Select a GPU
 
+The CUDA runtime reads `CUDA_DEVICE`:
+
+```bash
+CUDA_DEVICE=0 python run_gpu.py
+```
+
+or:
+
 ```bash
 CUDA_DEVICE=0 docker compose --profile gpu run --rm test-gpu
 ```
-
-The container receives all GPUs through Compose; `CUDA_DEVICE` selects which device the runtime uses.
 
 ## TF32
 
@@ -136,8 +182,14 @@ LFM_ALLOW_TF32=1
 Disable it with:
 
 ```bash
-LFM_ALLOW_TF32=0 docker compose --profile gpu run --rm test-gpu
+LFM_ALLOW_TF32=0 python run_gpu.py --dtype float32
 ```
+
+## Artifact publishing
+
+`.github/workflows/publish-artifacts.yml` reproduces the frozen LFM2.5 auxiliary artifacts with the canonical CPU preparation environment, generates `artifact-manifest.json`, and publishes all five files as individual assets in the persistent `lfm25-all14-artifacts-v1` GitHub Release.
+
+The release workflow is separate from the public CPU benchmark page so artifact distribution does not change the canonical CPU evidence protocol.
 
 ## Interpreting GPU results
 
