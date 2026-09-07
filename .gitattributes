@@ -1,0 +1,5 @@
+# Keep Linux shell scripts executable with Unix line endings even when cloned on Windows.
+*.sh text eol=lf
+Dockerfile* text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
