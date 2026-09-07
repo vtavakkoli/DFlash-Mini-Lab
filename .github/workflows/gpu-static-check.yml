@@ -1,29 +1,33 @@
-name: GPU direct-runner static check
+name: CPU/GPU direct-runner static check
 
 on:
   pull_request:
     paths:
+      - "Dockerfile.cpu"
       - "Dockerfile.gpu"
       - "docker-compose.yml"
+      - "run_cpu.py"
       - "run_gpu.py"
       - "scripts/test_gpu.sh"
       - "src/dflash_mini_lab/lfm_gpu_*.py"
       - "pyproject.toml"
       - "README.md"
-      - "docs/gpu.md"
+      - "docs/**"
       - ".github/workflows/gpu-static-check.yml"
       - ".github/workflows/publish-artifacts.yml"
   push:
     branches: [main]
     paths:
+      - "Dockerfile.cpu"
       - "Dockerfile.gpu"
       - "docker-compose.yml"
+      - "run_cpu.py"
       - "run_gpu.py"
       - "scripts/test_gpu.sh"
       - "src/dflash_mini_lab/lfm_gpu_*.py"
       - "pyproject.toml"
       - "README.md"
-      - "docs/gpu.md"
+      - "docs/**"
       - ".github/workflows/gpu-static-check.yml"
       - ".github/workflows/publish-artifacts.yml"
 
@@ -31,22 +35,24 @@ permissions:
   contents: read
 
 jobs:
-  validate-gpu-path:
+  validate-direct-paths:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v6
 
-      - name: Compile direct runner and GPU modules
+      - name: Compile zero-install runners and GPU modules
         run: |
           python -m py_compile \
+            run_cpu.py \
             run_gpu.py \
             src/dflash_mini_lab/lfm_gpu_runtime.py \
             src/dflash_mini_lab/lfm_gpu_check.py \
             src/dflash_mini_lab/lfm_gpu_benchmark.py
+          python run_cpu.py --help >/dev/null
           python run_gpu.py --help >/dev/null
 
-      - name: Test zero-install direct artifact downloader
+      - name: Test shared direct artifact downloader
         run: |
           mkdir -p mock-release mock-downloaded
           printf 'aux-pt-test\n' > mock-release/lfm_aux.pt
@@ -64,7 +70,7 @@ jobs:
               files[name]={'sha256':hashlib.sha256(p.read_bytes()).hexdigest(),'size_bytes':p.stat().st_size}
           (root/'artifact-manifest.json').write_text(json.dumps({'format_version':1,'model_id':'test','source_sha':'test','files':files}),encoding='utf-8')
           PY
-          python run_gpu.py \
+          python run_cpu.py \
             --download-only \
             --artifact-base-url "file://$PWD/mock-release" \
             --artifact-dir mock-downloaded
@@ -74,18 +80,25 @@ jobs:
       - name: Validate GPU shell entrypoint
         run: bash -n scripts/test_gpu.sh
 
-      - name: Validate Docker Compose GPU service
+      - name: Validate Docker Compose CPU and GPU services
         run: |
-          docker compose --profile gpu config -q
+          docker compose --profile cpu --profile gpu config -q
+          docker compose --profile cpu config --services | grep -qx test-cpu
           docker compose --profile gpu config --services | grep -qx test-gpu
 
-      - name: Verify CUDA and zero-install Docker path
+      - name: Verify zero-install Docker paths
         run: |
+          grep -q 'torch==2.10.0' Dockerfile.cpu
+          grep -q 'download.pytorch.org/whl/cpu' Dockerfile.cpu
+          grep -q 'COPY run_gpu.py run_cpu.py' Dockerfile.cpu
+          ! grep -q 'pip install \.' Dockerfile.cpu
           grep -q 'torch==2.10.0' Dockerfile.gpu
           grep -q 'download.pytorch.org/whl/cu128' Dockerfile.gpu
           grep -q 'COPY run_gpu.py' Dockerfile.gpu
           ! grep -q 'pip install \.' Dockerfile.gpu
           grep -q 'gpus: all' docker-compose.yml
+          grep -q 'test-cpu:' docker-compose.yml
+          grep -q 'test-gpu:' docker-compose.yml
           grep -q 'gh release upload' .github/workflows/publish-artifacts.yml
           grep -q 'lfm_aux.pt' .github/workflows/publish-artifacts.yml
           grep -q 'lfm_dspark.pt' .github/workflows/publish-artifacts.yml
