@@ -1,0 +1,55 @@
+name: GPU Docker static check
+
+on:
+  pull_request:
+    paths:
+      - "Dockerfile.gpu"
+      - "docker-compose.yml"
+      - "scripts/test_gpu.sh"
+      - "src/dflash_mini_lab/lfm_gpu_*.py"
+      - "pyproject.toml"
+      - "README.md"
+      - "docs/gpu.md"
+      - ".github/workflows/gpu-static-check.yml"
+  push:
+    branches: [main]
+    paths:
+      - "Dockerfile.gpu"
+      - "docker-compose.yml"
+      - "scripts/test_gpu.sh"
+      - "src/dflash_mini_lab/lfm_gpu_*.py"
+      - "pyproject.toml"
+      - "README.md"
+      - "docs/gpu.md"
+      - ".github/workflows/gpu-static-check.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  validate-gpu-path:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Compile GPU Python modules
+        run: |
+          python -m py_compile \
+            src/dflash_mini_lab/lfm_gpu_runtime.py \
+            src/dflash_mini_lab/lfm_gpu_check.py \
+            src/dflash_mini_lab/lfm_gpu_benchmark.py
+
+      - name: Validate GPU shell entrypoint
+        run: bash -n scripts/test_gpu.sh
+
+      - name: Validate Docker Compose GPU service
+        run: |
+          docker compose --profile gpu config -q
+          docker compose --profile gpu config --services | grep -qx test-gpu
+
+      - name: Verify CUDA wheel pin
+        run: |
+          grep -q 'torch==2.10.0' Dockerfile.gpu
+          grep -q 'download.pytorch.org/whl/cu128' Dockerfile.gpu
+          grep -q 'gpus: all' docker-compose.yml
