@@ -1,185 +1,118 @@
-# LFM2.5 All-12 algorithm notes
+# LFM2.5 All-14 algorithm notes
 
-The canonical benchmark in this repository evaluates **12 speculative-decoding mechanisms against one target model: `LiquidAI/LFM2.5-350M-Base`**. Normal target-only greedy decoding is method `00` and defines both the exact reference output and the `1.000×` throughput baseline.
+The canonical benchmark evaluates **14 speculative-decoding mechanisms against one target model: `LiquidAI/LFM2.5-350M-Base`**. Normal target-only greedy decoding is method `00` and defines both the exact reference output and the `1.000×` throughput baseline.
 
-All speculative methods are approximate until the same LFM2.5 target verifier accepts the matching prefix. Complete generated sequences are compared with normal greedy decoding.
+All speculative proposals remain approximate until the same LFM2.5 target verifier accepts the matching prefix. Complete generated sequences are compared with normal greedy decoding.
 
-> DFlash3 through DFlash12 are experimental lab variants. Their names describe this repository's research sequence and are not upstream official DFlash release numbers.
+> DFlash3 through DFlash14 are experimental lab variants. Their numbers describe this repository's research sequence, not upstream official DFlash releases.
 
-## Method 00 — Normal autoregressive
+## Method map
 
-One target step produces one greedy token. No draft model or candidate selector is used.
+| # | Method | Main idea | Guidance/correction complexity |
+|---:|---|---|---|
+| 00 | Normal | target-only greedy decoding | O(N) target steps |
+| 01 | DFlash | parallel future-block argmax | draft + verify |
+| 02 | DFlash2 | predecessor-aware top-k DP | O(BK²) |
+| 03 | DFlash3-MOBS | middle-out local path construction | O(BK) |
+| 04 | DFlash4-JUMP-MOBS | sparse jump anchors + gap fill | O(BK + JK) + jump pass |
+| 05 | DFlash5-FUSED-JUMP | reuse drafter hidden state for sparse anchors | O(BK + JKR) |
+| 06 | DFlash6-Boltzmann | deterministic top-k exploration | O(BK) |
+| 07 | DFlash6-BMOBS | Boltzmann anchor + MOBS fill | O(BK) |
+| 08 | DFlash7-ACT | margin-based verifier horizon | O(B) routing |
+| 09 | V9 DSpark-Lite | low-rank Markov correction + survival head | O(BK × rank) |
+| 10 | V10 Advanced Boltzmann | sparse top-2 uncertainty routing | sparse O(BK) |
+| 11 | V11 Gated-MOBS | route only uncertain slots to MOBS | O(MK), M ≤ B |
+| 12 | V12 PARAREAL | full-field learned fine-minus-coarse correction | O(RBKD) + O(BKH) |
+| 13 | **V13 MinOp** | **fused Torch top-2 + one-slot V10 policy** | **O(B) routing after top-2** |
+| 14 | **V14 Simple PARAREAL** | **scalar fine-gap estimator + one residual update** | **O(B)** |
 
-## Method 01 — DFlash
+These expressions describe selector/correction work, not total Transformer inference complexity.
 
-A compact non-causal drafter predicts the full future block in parallel. The target verifies the proposed block and accepts its matching prefix.
+## V10 -> V13: optimize the low-operation path
 
-**Guidance:** parallel draft argmax.  
-**Cost model:** draft forward + target verification.
+V10 obtains full draft logits in NumPy, performs a top-2 search, then routes only a small number of uncertain positions.
 
-## Method 02 — DFlash2-style path selection
-
-Retain top-`K` candidates at every future position and use predecessor-conditioned transition scores with dynamic programming.
-
-```text
-K + (B - 1) K²
-```
-
-**Guidance complexity:** `O(BK²)`.
-
-## Method 03 — DFlash3-MOBS
-
-MOBS chooses a central anchor and expands left/right, scoring only `K` candidates against already selected neighbors.
-
-**Guidance complexity:** `O(BK)`.
-
-## Method 04 — DFlash4-JUMP-MOBS
-
-A separate jump head predicts sparse future anchors. MOBS-style local scoring fills the remaining gaps.
-
-**Guidance complexity:** approximately `O(BK + JK)`, plus a separate jump-head forward pass.
-
-## Method 05 — DFlash5-FUSED-JUMP
-
-Reuse the DFlash hidden state to create sparse residual anchors, removing DFlash4's extra jump forward pass.
-
-**Guidance complexity:** approximately `O(BK + JKR)`.
-
-## Method 06 — DFlash6-Boltzmann
-
-Training-free deterministic exploration over the retained top-`K` set. Effective temperature decreases when the top-1/top-2 draft margin is large.
+V13 keeps the same policy family but changes the execution path:
 
 ```text
-score(c) = z(c) / T_i + deterministic_gumbel(context, position, token_id)
+V10:
+Torch drafter -> B×V NumPy logits -> NumPy top-2 -> sparse decision
+
+V13:
+Torch drafter -> torch.topk(2) -> B×2 NumPy values -> one sparse decision
 ```
 
-**Guidance complexity:** `O(BK)` with no additional neural forward pass.
+The selected V10 temperature, margin cutoff and margin slope are reused. V13 hard-limits the routing budget to one position, so the V10→V13 comparison measures whether less data movement and simpler routing can preserve the useful proposal behavior.
 
-## Method 07 — DFlash6-BMOBS
+For the routed slot, V13 uses a deterministic two-way Boltzmann probability based on the top1-top2 margin. All non-routed slots remain ordinary DFlash top-1.
 
-Use deterministic Boltzmann scoring at one uncertain middle anchor and fill the remaining positions with MOBS.
+## V12 -> V14: compress the Parareal state
 
-**Guidance complexity:** `O(BK)`.
-
-## Method 08 — DFlash7-ACT
-
-ACT uses the already-computed draft margin to shorten an uncertain suffix before LFM2.5 verification. The margin threshold is calibrated on prompts that are separate from the benchmark prompts.
-
-**Guidance complexity:** `O(B)` routing; no additional model forward pass.
-
-## Method 09 — V9 DSpark-Lite
-
-A frozen DFlash backbone is augmented with:
-
-- a low-rank previous-token Markov correction; and
-- a scalar prefix-survival confidence head.
-
-The survival confidence decides how much of the proposed suffix is worth verifying.
-
-**Guidance complexity:** approximately `O(BK × rank)`.
-
-## Method 10 — V10 Advanced Boltzmann
-
-Confident slots remain on the ordinary argmax path. Candidate exploration is spent only on a bounded set of uncertain positions. Configuration is chosen by a bounded calibration procedure on separate prompts.
-
-**Guidance complexity:** sparse `O(BK)`; training steps = `0`.
-
-## Method 11 — V11 Boltzmann-Gated MOBS
-
-A deterministic Boltzmann uncertainty score is used as a **routing signal**, not as an authority. Only a bounded number of uncertain slots receive MOBS pair scoring; confident slots remain DFlash argmax.
-
-**Guidance complexity:** approximately `O(MK)` with `M ≤ B` selected slots.
-
-## Method 12 — DFlash12-PARAREAL
-
-V12 introduces **parallel linear residual correction in continuous top-`K` score space**.
-
-### Coarse/fine mapping
+V12 operates on a continuous `B×K` score field. Its coarse/fine mapping is:
 
 ```text
 G = DFlash top-k block score field
-F = frozen LFM2.5 teacher score field on the same candidate IDs
+F = frozen LFM target score field on the same candidates, preparation only
 ```
 
-`F` is available only during preparation. V12 learns a small ridge-regression approximation to the fine-minus-current residual.
+It learns a multi-feature residual and applies repeated correction rounds.
 
-Token IDs are never added or subtracted.
-
-### Closed-form residual model
-
-For standardized feature matrix `X` and residual target `y`:
+V14 keeps the coarse/fine residual idea but reduces each block position to one scalar:
 
 ```text
-β = (XᵀX + λI)⁻¹ Xᵀy
+G = draft_logit(top1) - draft_logit(top2)
+F = target_logit(top1) - target_logit(top2)   # preparation only
 ```
 
-with:
+The fine estimator is:
 
 ```text
-y = center(F) - q
+F_hat = a + b·G + c·p
 ```
 
-The intercept is not regularized.
+where `p` is normalized block position. The three coefficients are fit by closed-form ridge regression.
 
-### Repeated parallel correction
+The one-round Parareal-style update is:
 
 ```text
-q₀ = center(G)
-Δ_k = clip(R_linear(features(q_k, G)), -c, +c)
-q_(k+1) = center(q_k + damping · Δ_k)
+gap_0 = G
+gap_1 = G + damping · (F_hat - G)
 ```
 
-Every `B × K` candidate row is corrected in vectorized linear algebra. The default uses two correction rounds.
+If the corrected gap crosses the switch threshold, at most the single most negative slot may change from draft top-1 to draft top-2.
 
-### Features
+This changes the research question from:
 
-The eight default features are:
+> Can we reconstruct the full fine score field?
 
-1. current centered candidate score;
-2. original coarse centered score;
-3. normalized candidate rank;
-4. normalized block position;
-5. coarse top-1/top-2 margin;
-6. candidate similarity to the last prefix-token embedding;
-7. candidate similarity to the prefix-mean embedding;
-8. current-score × block-position interaction.
+to:
 
-### Convergence diagnostics
+> Can we cheaply identify the one DFlash top-2 correction most worth trying?
 
-During preparation and internal holdout evaluation:
+## V14 estimator diagnostics
 
-```text
-E_k = mean((center(F) - q_k)²)
-```
+The V14 preparation artifact records:
 
-The artifact stores `E_k`, `log(E_k)`, contraction ratios `E_(k+1)/E_k`, and fine top-1 agreement. These diagnostics are not inference-time oracles.
+- fine-gap MSE and MAE;
+- corrected sign accuracy;
+- coarse sign accuracy;
+- teacher top-2 preference rate;
+- predicted switch rate;
+- switch precision and recall.
 
-**Correction complexity:** `O(RBKD)` plus `O(BKH)` vectorized embedding similarities. V12 adds no target forward pass and no neural correction forward pass.
+These metrics describe the estimator only. End-to-end performance is established by the canonical LFM2.5 benchmark.
 
-## Canonical complexity summary
+## Exactness contract
 
-```text
-00 Normal:                 O(N) target steps
-01 DFlash:                 parallel block draft + verify
-02 DFlash2:                O(BK²)
-03 DFlash3-MOBS:           O(BK)
-04 DFlash4-JUMP:           O(BK + JK) + jump forward
-05 DFlash5-FUSED:          O(BK + JKR)
-06 DFlash6-Boltzmann:      O(BK)
-07 DFlash6-BMOBS:          O(BK)
-08 DFlash7-ACT:            O(B) routing
-09 V9 DSpark-Lite:         O(BK × rank)
-10 V10 Advanced Boltzmann: sparse O(BK)
-11 V11 Gated-MOBS:         O(MK), M ≤ B
-12 V12 PARAREAL:           O(RBKD) + O(BKH)
-```
+Every speculative method follows the same rule:
 
-These expressions describe guidance/correction work, not total Transformer inference cost.
+1. draft a block;
+2. optionally apply its guidance/correction mechanism;
+3. run the authoritative target verifier;
+4. accept only the matching prefix;
+5. insert the target token at the first mismatch;
+6. continue until the requested output length is reached.
 
-## Exactness and interpretation
+A higher acceptance rate, lower teacher error, lower guidance count or fewer target calls is **not** by itself a speed claim. Only measured wall-clock throughput from the same matched run supports a speedup statement.
 
-A higher acceptance rate, lower teacher-space error, or fewer target calls is **not** sufficient to claim a speedup. The repository reports end-to-end wall-clock throughput under the same LFM2.5 workload and preserves negative results.
-
-The GitHub Pages site is generated from the unified LFM2.5 workflow and reports every method in the same run.
-
-See [`version12-parareal.md`](version12-parareal.md) for the complete V12 derivation and [`reproducibility.md`](reproducibility.md) for the benchmark protocol.
+See [`version12-parareal.md`](version12-parareal.md), [`version13-14.md`](version13-14.md), and [`reproducibility.md`](reproducibility.md).
