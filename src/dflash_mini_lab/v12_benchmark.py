@@ -8,6 +8,8 @@ from pathlib import Path
 
 import numpy as np
 
+from .lfm_verification import trim_proposal, verify_draft as _verify
+
 from .lfm_benchmark import RealDecodeStats, normal_decode, speculative_decode
 from .lfm_dspark import LfmDSparkRuntime
 from .v11_benchmark import V11_METHOD, v11_decode
@@ -43,18 +45,6 @@ def _greedy_reference(runtime: LfmDSparkRuntime, input_ids: np.ndarray, max_new_
     return seq
 
 
-def _verify(runtime: LfmDSparkRuntime, seq: np.ndarray, proposal: np.ndarray):
-    verify_input = np.concatenate([seq, proposal])
-    t0 = time.perf_counter()
-    logits = runtime.target_logits(verify_input)
-    elapsed = time.perf_counter() - t0
-    prefix = int(seq.size)
-    width = int(proposal.size)
-    verifier = np.argmax(logits[prefix - 1 : prefix - 1 + width], axis=-1).astype(np.int64)
-    mismatch = np.flatnonzero(proposal != verifier)
-    accepted = width if mismatch.size == 0 else int(mismatch[0])
-    return verifier, accepted, elapsed
-
 
 def v12_decode(
     runtime: LfmDSparkRuntime,
@@ -87,7 +77,7 @@ def v12_decode(
         t0 = time.perf_counter()
         full, meta = select_v12_parareal(runtime, draft_logits, context, model, config)
         selection_seconds += time.perf_counter() - t0
-        proposal = np.asarray(full[: min(int(full.size), remaining)], dtype=np.int64)
+        proposal = trim_proposal(runtime, full, remaining)
         proposed_total += int(proposal.size)
         linear_candidate_scores += int(meta.get("candidate_scores", 0))
         update_rms.extend(float(x) for x in meta.get("update_rms", []))
@@ -99,7 +89,7 @@ def v12_decode(
 
         if accepted:
             seq = np.concatenate([seq, proposal[:accepted]])
-        if accepted < int(proposal.size) and int(seq.size) - start_len < int(max_new_tokens):
+        if accepted < int(verifier.size) and int(seq.size) - start_len < int(max_new_tokens):
             seq = np.append(seq, verifier[accepted])
 
     seq = seq[: start_len + int(max_new_tokens)]

@@ -11,6 +11,8 @@ import time
 
 import numpy as np
 
+from .lfm_verification import target_token_ids, trim_proposal, verify_draft as _verify
+
 from .lfm_runtime import LfmReferenceRuntime
 
 
@@ -93,9 +95,9 @@ def normal_decode(runtime: LfmReferenceRuntime, input_ids: np.ndarray, max_new_t
     calls = 0; target_seconds = 0.0
     t0 = time.perf_counter()
     for _ in range(max_new_tokens):
-        t = time.perf_counter(); logits = runtime.target_logits(seq); target_seconds += time.perf_counter() - t
+        t = time.perf_counter(); predicted = target_token_ids(runtime, seq, int(seq.size) - 1); target_seconds += time.perf_counter() - t
         calls += 1
-        seq = np.append(seq, int(np.argmax(logits[-1])))
+        seq = np.append(seq, int(predicted[0]))
     wall = time.perf_counter() - t0
     return seq, RealDecodeStats("normal", max_new_tokens, calls, 0, 0, 0, wall, target_seconds=target_seconds)
 
@@ -165,19 +167,15 @@ def speculative_decode(
             raise ValueError(method)
         selection_seconds += time.perf_counter() - t
 
-        proposal = np.asarray(proposal, dtype=np.int64)[: min(int(np.asarray(proposal).size), remaining)]
+        proposal = trim_proposal(runtime, proposal, remaining)
         proposed_total += int(proposal.size)
-        verify_input = np.concatenate([seq, proposal])
-        t = time.perf_counter(); logits = runtime.target_logits(verify_input); target_seconds += time.perf_counter() - t
+        verifier, accepted, elapsed = _verify(runtime, seq, proposal)
+        target_seconds += elapsed
         target_calls += 1
-        p, k = int(seq.size), int(proposal.size)
-        verifier = np.argmax(logits[p - 1 : p - 1 + k], axis=-1).astype(np.int64)
-        mismatch = np.flatnonzero(proposal != verifier)
-        accepted = k if mismatch.size == 0 else int(mismatch[0])
         accepted_total += accepted
         if accepted:
             seq = np.concatenate([seq, proposal[:accepted]])
-        if accepted < k and int(seq.size) - start_len < max_new_tokens:
+        if accepted < int(verifier.size) and int(seq.size) - start_len < max_new_tokens:
             seq = np.append(seq, verifier[accepted])
 
     seq = seq[: start_len + max_new_tokens]

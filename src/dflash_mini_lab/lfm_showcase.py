@@ -10,6 +10,8 @@ import time
 
 import numpy as np
 
+from .lfm_verification import trim_proposal, verify_draft as _verify
+
 from .lfm_benchmark import LABELS, RealDecodeStats, _read_prompts, run_real_benchmark
 from .lfm_runtime import LfmReferenceRuntime
 
@@ -83,27 +85,20 @@ def dflash7_decode(
         raw_len = min(int(full_proposal.size), remaining)
         verify_len, margins = _leading_confident_length(draft_logits, float(margin_threshold), raw_len)
         verify_len = min(max(1, int(verify_len)), raw_len)
-        proposal = full_proposal[:verify_len]
+        proposal = trim_proposal(runtime, full_proposal[:verify_len], remaining)
         raw_draft_total += raw_len
         trimmed_total += max(0, raw_len - verify_len)
         all_margins.extend(margins[:raw_len])
         selection_seconds += time.perf_counter() - t
 
         proposed_total += int(proposal.size)
-        verify_input = np.concatenate([seq, proposal])
-        t = time.perf_counter()
-        logits = runtime.target_logits(verify_input)
-        target_seconds += time.perf_counter() - t
+        verifier, accepted, elapsed = _verify(runtime, seq, proposal)
+        target_seconds += elapsed
         target_calls += 1
-
-        p, k = int(seq.size), int(proposal.size)
-        verifier = np.argmax(logits[p - 1 : p - 1 + k], axis=-1).astype(np.int64)
-        mismatch = np.flatnonzero(proposal != verifier)
-        accepted = k if mismatch.size == 0 else int(mismatch[0])
         accepted_total += accepted
         if accepted:
             seq = np.concatenate([seq, proposal[:accepted]])
-        if accepted < k and int(seq.size) - start_len < int(max_new_tokens):
+        if accepted < int(verifier.size) and int(seq.size) - start_len < int(max_new_tokens):
             seq = np.append(seq, verifier[accepted])
 
     seq = seq[: start_len + int(max_new_tokens)]

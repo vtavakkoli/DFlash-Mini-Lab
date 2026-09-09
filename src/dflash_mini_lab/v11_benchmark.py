@@ -9,6 +9,8 @@ from pathlib import Path
 
 import numpy as np
 
+from .lfm_verification import trim_proposal, verify_draft as _verify
+
 from .lfm_benchmark import RealDecodeStats, _read_prompts, normal_decode, speculative_decode
 from .lfm_dspark import LfmDSparkRuntime
 from .lfm_v9v10_benchmark import _greedy_reference, dspark_decode, run as run_v10_study, v10_decode
@@ -28,15 +30,6 @@ LABELS = {
 }
 
 
-def _verify(runtime: LfmDSparkRuntime, seq: np.ndarray, proposal: np.ndarray):
-    verify_input = np.concatenate([seq, proposal])
-    t = time.perf_counter(); logits = runtime.target_logits(verify_input); elapsed = time.perf_counter() - t
-    p, k = int(seq.size), int(proposal.size)
-    verifier = np.argmax(logits[p - 1 : p - 1 + k], axis=-1).astype(np.int64)
-    mismatch = np.flatnonzero(proposal != verifier)
-    accepted = k if mismatch.size == 0 else int(mismatch[0])
-    return verifier, accepted, elapsed
-
 
 def v11_decode(runtime: LfmDSparkRuntime, input_ids: np.ndarray, max_new_tokens: int, *, config: V11Config):
     seq = np.asarray(input_ids, dtype=np.int64).copy(); start_len = int(seq.size)
@@ -49,13 +42,13 @@ def v11_decode(runtime: LfmDSparkRuntime, input_ids: np.ndarray, max_new_tokens:
         t = time.perf_counter(); context = runtime.context_features(seq); context_seconds += time.perf_counter() - t
         t = time.perf_counter(); draft_logits = runtime.draft_logits(context); draft_seconds += time.perf_counter() - t; draft_calls += 1
         t = time.perf_counter(); full, meta = select_v11_boltzmann_gated_mobs(runtime, draft_logits, context, int(seq[-1]), config)
-        proposal = np.asarray(full[: min(int(full.size), remaining)], dtype=np.int64)
+        proposal = trim_proposal(runtime, full, remaining)
         block_evals = min(int(full.size), remaining); gate_evals += block_evals
         pair_scores += int(meta["pair_scores"]); gated += int(meta["gated_positions"]); eligible += int(meta["eligible_positions"]); fast += int(meta["fast_argmax_positions"])
         uncertainty_sum += float(meta.get("mean_uncertainty", 0.0)) * block_evals; selection_seconds += time.perf_counter() - t; proposed_total += int(proposal.size)
         verifier, accepted, elapsed = _verify(runtime, seq, proposal); target_seconds += elapsed; target_calls += 1; accepted_total += int(accepted)
         if accepted: seq = np.concatenate([seq, proposal[:accepted]])
-        if accepted < int(proposal.size) and int(seq.size) - start_len < int(max_new_tokens): seq = np.append(seq, verifier[accepted])
+        if accepted < int(verifier.size) and int(seq.size) - start_len < int(max_new_tokens): seq = np.append(seq, verifier[accepted])
     seq = seq[: start_len + int(max_new_tokens)]; wall = time.perf_counter() - wall0
     stats = RealDecodeStats(method=V11_METHOD, new_tokens=int(max_new_tokens), target_forward_passes=target_calls, draft_forward_passes=draft_calls, accepted_draft_tokens=accepted_total, proposed_draft_tokens=proposed_total, wall_seconds=wall, target_seconds=target_seconds, context_seconds=context_seconds, draft_seconds=draft_seconds, selection_seconds=selection_seconds, selector_pair_scores=pair_scores, boltzmann_candidate_scores=gate_evals)
     meta = {"v11_pair_scores": int(pair_scores), "v11_gate_evaluations": int(gate_evals), "v11_gated_positions": int(gated), "v11_eligible_positions": int(eligible), "v11_fast_argmax_positions": int(fast), "v11_mean_uncertainty": float(uncertainty_sum / max(gate_evals, 1))}

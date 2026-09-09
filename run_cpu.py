@@ -108,6 +108,8 @@ def _benchmark_namespace(args: argparse.Namespace) -> argparse.Namespace:
         prompt_limit=int(prompt_limit),
         calibration_tokens=int(args.calibration_tokens),
         calibration_prompt_limit=int(calibration_prompt_limit),
+        tune=args.tune,
+        tuning_repeats=args.tuning_repeats,
         top_k=8,
         jump_weight=0.5,
         fused_weight=1.0,
@@ -122,6 +124,8 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="Zero-install DFlash Mini Lab CPU runner: download artifacts and run canonical All-14"
     )
+    p.add_argument("--tune", action="store_true", help="Choose verification widths on separate calibration prompts")
+    p.add_argument("--tuning-repeats", type=int, default=2)
     p.add_argument("--artifact-dir", default="cpu-artifacts")
     p.add_argument("--output-dir", default="cpu-reports")
     p.add_argument("--artifact-release-tag", default=DEFAULT_RELEASE_TAG)
