@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import os
 from pathlib import Path
 
@@ -60,6 +61,10 @@ class LfmReferenceRuntime:
         self.model_id = model_id or config.model_id; torch_dtype = torch.float32 if dtype == "float32" else torch.bfloat16
         self.tokenizer = AutoTokenizer.from_pretrained(self.model_id); self.target = AutoModelForCausalLM.from_pretrained(self.model_id, dtype=torch_dtype); self.target.eval(); self.target.to("cpu"); self.embedding = self.target.get_input_embeddings().weight.detach()
         self.target_parameter_count = sum(p.numel() for p in self.target.parameters()); self.aux_parameter_count = sum(p.numel() for model in (self.drafter, self.selector, self.jump, self.fused) for p in model.parameters())
+        self.optimize_target_logits = os.getenv("LFM_OPTIMIZE_TARGET", "1").lower() not in {"0", "false"}
+        self.use_bonus_token = os.getenv("LFM_BONUS_TOKEN", "1").lower() not in {"0", "false"}
+        self.max_verify_tokens = 0
+        self._supports_logits_to_keep = "logits_to_keep" in inspect.signature(self.target.forward).parameters
 
     def encode(self, text: str) -> np.ndarray:
         return np.asarray(self.tokenizer.encode(text, add_special_tokens=True), dtype=np.int64)
@@ -71,6 +76,29 @@ class LfmReferenceRuntime:
     def target_logits(self, input_ids: np.ndarray) -> np.ndarray:
         ids = torch.from_numpy(np.asarray(input_ids, dtype=np.int64)).long().unsqueeze(0); out = self.target(input_ids=ids, use_cache=False, return_dict=True)
         return out.logits[0].float().cpu().numpy()
+
+    @torch.inference_mode()
+    def target_greedy_tokens(self, input_ids: np.ndarray, start: int) -> np.ndarray:
+        """Project only needed suffix rows; transfer IDs instead of vocabulary scores.
+
+        LFM's hybrid convolution state needs more than a KV-cache crop to roll
+        back rejected drafts. Keep use_cache=False here for authoritative block
+        verification, and retain target_logits as the full-projection oracle.
+        """
+        tokens = np.asarray(input_ids, dtype=np.int64)
+        if tokens.ndim != 1 or not 0 <= start < tokens.size:
+            raise ValueError("start must index a non-empty 1D token sequence")
+        if not self.optimize_target_logits:
+            return np.argmax(self.target_logits(tokens)[start:], axis=-1).astype(np.int64)
+        device = self.target.get_input_embeddings().weight.device
+        ids = torch.from_numpy(tokens).unsqueeze(0).to(device)
+        keep = int(tokens.size) - int(start)
+        kwargs = {"logits_to_keep": keep} if self._supports_logits_to_keep else {}
+        output = self.target(input_ids=ids, use_cache=False, return_dict=True, **kwargs)
+        logits = output.logits[0, -keep:]
+        # Greedy argmax does not require a float32 copy of the complete logits.
+        # cpu() also synchronizes CUDA before the caller stops its wall timer.
+        return logits.argmax(dim=-1).cpu().numpy().astype(np.int64, copy=False)
 
     @torch.inference_mode()
     def context_features(self, input_ids: np.ndarray) -> np.ndarray:

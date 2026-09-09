@@ -11,6 +11,7 @@ import numpy as np
 from . import lfm_all12_benchmark as base
 from .lfm_benchmark import _read_prompts
 from .lfm_dspark import LfmDSparkRuntime
+from .lfm_tuning import calibrate_verify_widths
 from .lfm_showcase import calibrate_act
 from .lfm_v9v10_benchmark import calibrate_dspark, calibrate_v10
 from .v11_benchmark import V11_METHOD, calibrate_v11
@@ -90,7 +91,16 @@ def _summary(rows: list[dict]) -> dict:
     return result
 
 
-def _run_method(
+def _run_method(method, runtime, ids, tokens, **kwargs):
+    previous = getattr(runtime, "max_verify_tokens", 0)
+    runtime.max_verify_tokens = getattr(runtime, "verify_widths", {}).get(method, previous)
+    try:
+        return _run_method_impl(method, runtime, ids, tokens, **kwargs)
+    finally:
+        runtime.max_verify_tokens = previous
+
+
+def _run_method_impl(
     method: str,
     runtime: LfmDSparkRuntime,
     ids: np.ndarray,
@@ -271,11 +281,18 @@ def run(args: argparse.Namespace) -> dict:
     calibration_prompts = _read_prompts(args.calibration_prompts, args.calibration_prompt_limit)
     if not prompts or not calibration_prompts:
         raise ValueError("benchmark and calibration prompt sets must be non-empty")
+    if {p.strip() for p in prompts} & {p.strip() for p in calibration_prompts}:
+        raise ValueError("benchmark and calibration prompts must be disjoint")
+    if args.tokens < 1 or args.repeats < 1 or args.calibration_tokens < 1:
+        raise ValueError("tokens, repeats and calibration tokens must be positive")
+    if getattr(args, "tune", False) and getattr(args, "tuning_repeats", 2) < 1:
+        raise ValueError("tuning repeats must be positive")
 
     warm_ids = runtime.encode(prompts[0])
     _ = runtime.target_logits(warm_ids)
     _ = runtime.draft_logits(runtime.context_features(warm_ids))
 
+    print("Calibrating ACT, DSpark, V10 and V11 on separate prompts...", flush=True)
     act_threshold, act_cal = calibrate_act(runtime, calibration_prompts, tokens=args.calibration_tokens)
     dspark_floor, dspark_cal = calibrate_dspark(
         runtime, calibration_prompts, tokens=args.calibration_tokens, top_k=args.top_k
@@ -286,6 +303,29 @@ def run(args: argparse.Namespace) -> dict:
     v12_config = base._v12_config(v12_model, args.top_k)
     v14_estimator = load_estimator(args.v14_model)
 
+    width_calibration = {"enabled": False}
+    if getattr(args, "tune", False):
+        print("Calibrating verification widths for all 14 methods...", flush=True)
+        def trial(method, ids, tokens):
+            return _run_method(
+                method, runtime, ids, tokens,
+                top_k=args.top_k, jump_weight=args.jump_weight,
+                fused_weight=args.fused_weight,
+                boltzmann_temperature=args.boltzmann_temperature,
+                bmobs_temperature=args.bmobs_temperature,
+                act_threshold=act_threshold, dspark_floor=dspark_floor,
+                v10_config=v10_config, v11_config=v11_config,
+                v12_model=v12_model, v12_config=v12_config,
+                v14_estimator=v14_estimator,
+            )
+        runtime.verify_widths, width_calibration = calibrate_verify_widths(
+            runtime, calibration_prompts, METHODS[1:], trial,
+            tokens=args.calibration_tokens,
+            repeats=getattr(args, "tuning_repeats", 2),
+        )
+        width_calibration["enabled"] = True
+
+    print("Benchmarking Normal + all 14 methods on held-out prompts...", flush=True)
     rows, summary, examples = benchmark(
         runtime,
         prompts,
@@ -321,10 +361,20 @@ def run(args: argparse.Namespace) -> dict:
             "calibration_prompt_count": len(calibration_prompts),
             "calibration_tokens": int(args.calibration_tokens),
             "top_k": int(args.top_k),
+            "jump_weight": float(args.jump_weight),
+            "fused_weight": float(args.fused_weight),
+            "boltzmann_temperature": float(args.boltzmann_temperature),
+            "bmobs_temperature": float(args.bmobs_temperature),
             "cpu_threads": int(args.cpu_threads),
             "dtype": args.dtype,
+            "target_suffix_projection": runtime.optimize_target_logits and runtime._supports_logits_to_keep,
+            "target_argmax_on_device": runtime.optimize_target_logits,
+            "bonus_token": runtime.use_bonus_token,
+            "target_cache": False,
+            "verify_width_tuning": bool(getattr(args, "tune", False)),
         },
         "selected_settings": {
+            "verify_widths": getattr(runtime, "verify_widths", {}),
             "act_margin_threshold": float(act_threshold),
             "dspark_survival_floor": float(dspark_floor),
             "v10": getattr(v10_config, "__dict__", {}),
@@ -351,6 +401,7 @@ def run(args: argparse.Namespace) -> dict:
             },
         },
         "calibration": {
+            "verify_widths": width_calibration,
             "dflash7_act": act_cal,
             "dspark_v9": dspark_cal,
             "boltzmann_v10": v10_cal,
@@ -374,6 +425,8 @@ def run(args: argparse.Namespace) -> dict:
     report = _report_html(data)
     (out / "report.html").write_text(report, encoding="utf-8")
     (out / "index.html").write_text(report, encoding="utf-8")
+    if not all(item["all_exact"] for item in summary.values()):
+        raise RuntimeError(f"Exactness check failed; diagnostic results saved to {out / 'benchmark.json'}")
     return data
 
 
@@ -397,6 +450,8 @@ def main() -> None:
     p.add_argument("--boltzmann-temperature", type=float, default=0.15)
     p.add_argument("--bmobs-temperature", type=float, default=0.35)
     p.add_argument("--cpu-threads", type=int, default=2)
+    p.add_argument("--tune", action="store_true", help="Calibrate verification width per method on separate prompts")
+    p.add_argument("--tuning-repeats", type=int, default=2)
     p.add_argument("--dtype", default="float32", choices=("float32", "bfloat16"))
     args = p.parse_args()
     data = run(args)

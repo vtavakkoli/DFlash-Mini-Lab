@@ -75,6 +75,8 @@ def main() -> None:
     p.add_argument("--fused-weight", type=float, default=1.0)
     p.add_argument("--boltzmann-temperature", type=float, default=0.15)
     p.add_argument("--bmobs-temperature", type=float, default=0.35)
+    p.add_argument("--tune", action="store_true", help="Calibrate verification width per method on CUDA")
+    p.add_argument("--tuning-repeats", type=int, default=2)
     p.add_argument("--cpu-threads", type=int, default=int(os.getenv("CPU_THREADS", "4")))
     p.add_argument(
         "--dtype",

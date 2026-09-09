@@ -54,6 +54,21 @@ python run_gpu.py --check-only
 python run_gpu.py --refresh-artifacts
 ```
 
+To tune each speculative method's verification length on your hardware:
+
+```bash
+python run_cpu.py --tune
+python run_gpu.py --tune
+```
+
+All 14 methods now share suffix-only target output projection, target-device
+greedy argmax, and an extra verified token after full draft acceptance. Normal
+decoding also uses the optimized target output path. `--tune` measures widths
+1, 2 and 4 on separate calibration prompts and records per-method selections in
+`benchmark.json`; the evaluation prompts remain held out. GPU gains must be
+measured on your GPU. See [`docs/performance.md`](docs/performance.md) for the
+before/after benchmark and the remaining hybrid-cache limitation.
+
 If required runtime dependencies are missing, the direct runners can install only those dependencies and restart themselves. The repository package itself is never installed.
 
 ## CPU test with Docker Compose

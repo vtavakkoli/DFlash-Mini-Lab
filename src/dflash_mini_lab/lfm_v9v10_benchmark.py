@@ -9,6 +9,8 @@ from pathlib import Path
 
 import numpy as np
 
+from .lfm_verification import trim_proposal, verify_draft as _verify
+
 from .lfm_benchmark import RealDecodeStats, _read_prompts
 from .lfm_dspark import LfmDSparkRuntime, confidence_verify_length
 from .lfm_showcase import SHOWCASE_LABELS, SHOWCASE_METHODS, run as run_existing_showcase
@@ -32,17 +34,6 @@ def _greedy_reference(runtime: LfmDSparkRuntime, ids: np.ndarray, tokens: int) -
     return seq
 
 
-def _verify(runtime: LfmDSparkRuntime, seq: np.ndarray, proposal: np.ndarray):
-    verify_input = np.concatenate([seq, proposal])
-    t = time.perf_counter()
-    logits = runtime.target_logits(verify_input)
-    elapsed = time.perf_counter() - t
-    p, k = int(seq.size), int(proposal.size)
-    verifier = np.argmax(logits[p - 1 : p - 1 + k], axis=-1).astype(np.int64)
-    mismatch = np.flatnonzero(proposal != verifier)
-    accepted = k if mismatch.size == 0 else int(mismatch[0])
-    return verifier, accepted, elapsed
-
 
 def dspark_decode(runtime: LfmDSparkRuntime, input_ids: np.ndarray, max_new_tokens: int, *, top_k: int, survival_floor: float, markov_weight: float = 1.0):
     seq = np.asarray(input_ids, dtype=np.int64).copy()
@@ -62,7 +53,7 @@ def dspark_decode(runtime: LfmDSparkRuntime, input_ids: np.ndarray, max_new_toke
         raw_len = min(int(full.size), remaining)
         keep = confidence_verify_length(confidences, float(survival_floor), raw_len)
         keep = min(max(1, int(keep)), raw_len)
-        proposal = np.asarray(full[:keep], dtype=np.int64)
+        proposal = trim_proposal(runtime, full[:keep], remaining)
         markov_scores += int(score_ops); confidence_evals += raw_len
         confidence_sum += float(np.asarray(confidences[:raw_len], dtype=np.float64).sum())
         trimmed += raw_len - keep
@@ -71,7 +62,7 @@ def dspark_decode(runtime: LfmDSparkRuntime, input_ids: np.ndarray, max_new_toke
         verifier, accepted, elapsed = _verify(runtime, seq, proposal)
         target_seconds += elapsed; target_calls += 1; accepted_total += int(accepted)
         if accepted: seq = np.concatenate([seq, proposal[:accepted]])
-        if accepted < int(proposal.size) and int(seq.size) - start_len < int(max_new_tokens): seq = np.append(seq, verifier[accepted])
+        if accepted < int(verifier.size) and int(seq.size) - start_len < int(max_new_tokens): seq = np.append(seq, verifier[accepted])
     seq = seq[: start_len + int(max_new_tokens)]
     wall = time.perf_counter() - wall0
     stats = RealDecodeStats(method="dspark_v9", new_tokens=int(max_new_tokens), target_forward_passes=target_calls, draft_forward_passes=draft_calls, accepted_draft_tokens=accepted_total, proposed_draft_tokens=proposed_total, wall_seconds=wall, target_seconds=target_seconds, context_seconds=context_seconds, draft_seconds=draft_seconds, selection_seconds=selection_seconds, selector_pair_scores=markov_scores)
@@ -89,13 +80,13 @@ def v10_decode(runtime: LfmDSparkRuntime, input_ids: np.ndarray, max_new_tokens:
         t = time.perf_counter(); context = runtime.context_features(seq); context_seconds += time.perf_counter() - t
         t = time.perf_counter(); draft_logits = runtime.draft_logits(context); draft_seconds += time.perf_counter() - t; draft_calls += 1
         t = time.perf_counter(); full, sel = select_v10_quickpath(runtime, draft_logits, context, int(seq[-1]), config)
-        proposal = np.asarray(full[: min(int(full.size), remaining)], dtype=np.int64)
+        proposal = trim_proposal(runtime, full, remaining)
         candidate_scores += int(sel["candidate_scores"]); uncertain += int(sel["uncertain_positions"]); sampled += int(sel["sampled_positions"]); fast += int(sel["fast_argmax_positions"])
         selection_seconds += time.perf_counter() - t; proposed_total += int(proposal.size)
         verifier, accepted, elapsed = _verify(runtime, seq, proposal)
         target_seconds += elapsed; target_calls += 1; accepted_total += int(accepted)
         if accepted: seq = np.concatenate([seq, proposal[:accepted]])
-        if accepted < int(proposal.size) and int(seq.size) - start_len < int(max_new_tokens): seq = np.append(seq, verifier[accepted])
+        if accepted < int(verifier.size) and int(seq.size) - start_len < int(max_new_tokens): seq = np.append(seq, verifier[accepted])
     seq = seq[: start_len + int(max_new_tokens)]; wall = time.perf_counter() - wall0
     stats = RealDecodeStats(method="boltzmann_v10", new_tokens=int(max_new_tokens), target_forward_passes=target_calls, draft_forward_passes=draft_calls, accepted_draft_tokens=accepted_total, proposed_draft_tokens=proposed_total, wall_seconds=wall, target_seconds=target_seconds, context_seconds=context_seconds, draft_seconds=draft_seconds, selection_seconds=selection_seconds, boltzmann_candidate_scores=candidate_scores)
     meta = {"v10_candidate_scores": int(candidate_scores), "v10_uncertain_positions": int(uncertain), "v10_sampled_positions": int(sampled), "v10_fast_argmax_positions": int(fast)}
